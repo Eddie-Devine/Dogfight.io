@@ -1,0 +1,2 @@
+bootstap js does not work because security is set to only let our scripts run
+if you want bootstrap js probably download and host bootstrap on server

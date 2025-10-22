@@ -1,0 +1,15 @@
+# Node dependencies
+/node_modules
+/dist
+/build
+/.cache
+
+# SSL/certs
+*.key
+*.pem
+
+# OS/IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

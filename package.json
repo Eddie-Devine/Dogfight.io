@@ -1,0 +1,27 @@
+{
+  "name": "dogfight.io",
+  "version": "1.0.0",
+  "description": "A 2D dogfighting IO game for the browser.",
+  "main": "Server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Eddie-Devine/Dogfight.io.git"
+  },
+  "author": "Eddie Devine",
+  "license": "SEE LICENSE IN LICENSE.txt",
+  "bugs": {
+    "url": "https://github.com/Eddie-Devine/Dogfight.io/issues"
+  },
+  "homepage": "https://github.com/Eddie-Devine/Dogfight.io#readme",
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^5.1.0",
+    "helmet": "^8.1.0",
+    "morgan": "^1.10.1",
+    "ws": "^8.18.3"
+  }
+}

@@ -1,9 +1,36 @@
 {
-    "jets": [
+    "Jets": [
         {
             "Name": "F-22 Raptor",
-            "Code": "F-22",
-            "Nation": "USA"
+            "Full Name": "Lockheed Martin F-22 Raptor",
+            "Nation": "USA",
+            "Code": "F22",
+            "Icon": "F22.png"
+        },
+        {
+            "Name": "F-15 Eagle",
+            "Full Name": "McDonnell Douglas F-15EX Eagle II",
+            "Nation": "USA",
+            "Code": "F15",
+            "Icon": "F15.png"
+        },
+        {
+            "Name": "F-14 Tomcat",
+            "Full Name": "Grumman F-14 Tomcat",
+            "Nation": "USA",
+            "Code": "F14"
+        },
+        {
+            "Name": "F-16 Fighting Falcon",
+            "Full Name": "General Dynamics F-16 Fighting Falcon",
+            "Nation": "USA",
+            "Code": "F16"
+        },
+        {
+            "Name": "F-18 Super Hornet",
+            "Full Name": "Boeing F/A-18E/F Super Hornet",
+            "Nation": "USA",
+            "Code": "F18"
         }
     ]
 }

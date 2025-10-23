@@ -1,83 +1,101 @@
 body {
-  font-family: 'Poppins', sans-serif;
+    font-family: 'Poppins', sans-serif;
 }
 
 #startBtn:hover {
-  transform: scale(1.05);
-  transition: 0.2s ease-in-out;
+    transform: scale(1.05);
+    transition: 0.2s ease-in-out;
 }
 
 a:hover {
-  color: #fff !important;
+    color: #fff !important;
 }
 
 /* === DEBUG MODE === */
 div {
-  outline: 1px solid red !important;
+    outline: 1px solid red !important;
 }
 
 /* --- Jet grid layout --- */
 .jet-grid-wrapper {
-  max-width: 560px;          /* keeps it from filling the whole column */
-  width: 100%;
+    max-width: 560px;
+    /* keeps it from filling the whole column */
+    width: 100%;
 }
 
 .jet-grid {
-  display: grid;
-  grid-template-columns: repeat(4, 1fr); /* 4x4 look */
-  gap: 14px;                              /* clean spacing */
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    /* 4x4 look */
+    gap: 14px;
+    /* clean spacing */
 }
 
 /* --- Jet cards --- */
 .jet-card {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
 
-  background: rgba(0,0,0,0.25);
-  border: 1px solid rgba(255,255,255,0.15);
-  border-radius: 12px;
-  padding: 12px;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 12px;
+    padding: 12px;
 
-  cursor: pointer;
-  outline: none;
-  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease, background 120ms ease;
-  user-select: none;
+    cursor: pointer;
+    outline: none;
+    transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease, background 120ms ease;
+    user-select: none;
 
-  /* make buttons unobtrusive */
-  color: inherit;
+    /* make buttons unobtrusive */
+    color: inherit;
 }
 
 .jet-card img {
-  display: block;
-  width: 100%;
-  height: 72px;          /* consistent tile look */
-  object-fit: contain;   /* keep aspect ratio without cropping */
-  pointer-events: none;
+    display: block;
+    width: 100%;
+    height: 72px;
+    /* consistent tile look */
+    object-fit: contain;
+    /* keep aspect ratio without cropping */
+    pointer-events: none;
 }
 
 .jet-card span {
-  font-size: 0.9rem;
-  opacity: 0.9;
+    font-size: 0.9rem;
+    opacity: 0.9;
 }
 
 /* Hover/focus growth */
 .jet-card:hover,
 .jet-card:focus-visible {
-  transform: scale(1.06);
-  box-shadow: 0 6px 16px rgba(0,0,0,0.35);
-  border-color: rgba(255,255,255,0.35);
-  background: rgba(255,255,255,0.06);
+    transform: scale(1.06);
+    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.35);
+    border-color: rgba(255, 255, 255, 0.35);
+    background: rgba(255, 255, 255, 0.06);
 }
 
 /* Selected state */
 .jet-card.is-selected {
-  border-color: #0d6efd;             /* Bootstrap primary */
-  box-shadow: 0 0 0 3px rgba(13,110,253,0.35);
+    border-color: #0d6efd;
+    /* Bootstrap primary */
+    box-shadow: 0 0 0 3px rgba(13, 110, 253, 0.35);
 }
 
 @media (min-width: 1600px) {
-  .jet-card img { height: 80px; }
+    .jet-card img {
+        height: 80px;
+    }
+}
+
+.jet-preview {
+    border: 6px solid #444;
+    /* thick dark border */
+    border-radius: 20px;
+    /* curved corners */
+    box-shadow: 0 0 10px rgba(0, 0, 0, 0.4);
+    /* subtle depth */
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
 }

@@ -28,7 +28,21 @@ app.get('/', (req, res) => {
 });
 
 // Serve static files from public
-app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.static(path.join(__dirname, 'public'), {
+	// regular cache for static assets if you want
+	maxAge: '1d'
+}));
+
+app.use('/API', express.static(path.join(__dirname, 'data'), {
+	maxAge: '1y',           // 1 year
+	immutable: true,        // adds "immutable" to Cache-Control
+	setHeaders: (res, filePath) => {
+		// Ensure correct MIME
+		res.setHeader('Content-Type', 'application/json; charset=utf-8');
+		// (Optional) CORS if another origin will fetch it
+		// res.setHeader('Access-Control-Allow-Origin', '*');
+	}
+}));
 
 // HTTP server for Express
 const server = https.createServer(creds, app);

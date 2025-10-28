@@ -1,127 +1,186 @@
-//Makes the jet grid interactive for selection
-function setupJetSelection() {
-    const grid = document.querySelector('.jet-grid'); //jet selection grid
-    if (!grid) return; //failsafe 
+// --------- DOM refs (cache once) ----------
+const grid = document.querySelector('.jet-grid');
+const jetPreview = document.querySelector('.jet-preview');
+const startBtn = document.getElementById('start-btn');
+const nameInput = document.getElementById('player-name');
+const PLACEHOLDER_SRC = jetPreview?.src || '';
 
-    let selected = null; //the selected card
-    const jetPreview = document.querySelector('.jet-preview'); //the stage for selected card
-    const PLACEHOLDER_SRC = jetPreview.src; //the default image set in the HTML
+let selectedCard = null;
+let selectedJet = null; // e.g., "F22"
 
-    //when jet is selectedj
-    grid.addEventListener('click', (e) => {
-        const card = e.target.closest('.jet-card');
-        if (!card) return; //failsafe
+// Ensure Start disabled initially
+if (startBtn) startBtn.disabled = true;
 
-        // Toggle off if clicking the same selected card
-        if (selected === card) {
-            card.classList.remove('is-selected');
-            selected = null;
-            if (jetPreview) {
-                jetPreview.src = PLACEHOLDER_SRC;
-                jetPreview.alt = 'No jet selected';
-            }
-            return;
-        }
-
-        // Normal select flow
-        if (selected) selected.classList.remove('is-selected');
-        card.classList.add('is-selected');
-        selected = card;
-
-        const img = card.querySelector('img');
-        if (img && jetPreview) {
-            jetPreview.src = img.src;
-            jetPreview.alt = img.alt || '';
-        }
-    });
-
-    // Keyboard support (Enter/Space)
-    grid.querySelectorAll('.jet-card').forEach((card) => {
-        card.setAttribute('type', 'button');
-        card.setAttribute('tabindex', '0');
-        card.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter' || e.code === 'Space') {
-                e.preventDefault();
-                card.click();
-            }
-        });
-    });
-
-    //add more hover response to jet cards
-    grid.querySelectorAll('.jet-card').forEach((card) => {
-        card.addEventListener('mouseenter', () => {
-            console.log('Hovered over:', card.dataset.jet);
-            const img = card.querySelector('img');
-            jetPreview.src = img.src;
-        });
-
-        card.addEventListener('mouseleave', () => {
-            console.log('Stopped hovering:', card.dataset.jet);
-            if (selected) {
-                const selImg = selected.querySelector('img');
-                if (selImg) {
-                    jetPreview.src = selImg.src;
-                    jetPreview.alt = selImg.alt || '';
-                }
-            }
-            else {
-                jetPreview.src = PLACEHOLDER_SRC;
-            }
-        });
-    });
+// Utility: update start button based on selection + name
+function updateStartButtonState() {
+    const nameFilled = nameInput && nameInput.value.trim().length > 0;
+    startBtn.disabled = !(selectedJet && nameFilled);
 }
 
-//add jets to gird
-function addJets(jetData) {
-    const jets = jetData['Jets'];
-    const grid = document.querySelector('.jet-grid');
-    jets.forEach(jet => {
-        // Create <button>
-        const btn = document.createElement('button');
-        btn.className = 'jet-card';
-        btn.dataset.jet = jet['Code'] || 'N/A'; //set code to make proccesing easier
-
-        // Create <img>
-        const img = document.createElement('img');
-        img.src = `/Images/JetIcons/${jet["Icon"]}` || '/Images/placeholder-jet.jpg';
-        img.alt = jet['Name'] || 'Unknown Jet';
-
-        // Create <span>
-        const span = document.createElement('span');
-        span.textContent = jet['Name'] || 'Unknown Jet';
-
-        // Build structure
-        btn.appendChild(img);
-        btn.appendChild(span);
-
-        // Add to DOM
-        grid.appendChild(btn);
-    });
-    setupJetSelection();
+// Preview helpers
+function setPreviewFromCard(card) {
+    if (!card || !jetPreview) return;
+    const img = card.querySelector('img');
+    if (img) {
+        jetPreview.src = img.src;
+        jetPreview.alt = img.alt || '';
+    }
 }
-
-//get jets from api
-async function fetchJetData() {
-    try {
-        const response = await fetch('/API/jets.json', {
-            headers: {
-                'Accept': 'application/json'
-            },
-            cache: 'no-cache' // ensures fresh copy each time (especially in dev)
-        });
-
-        if (!response.ok) {
-            throw new Error(`HTTP ${response.status} - ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        return addJets(data); // you can handle or return this
-    } catch (err) {
-        console.error('Error fetching JSON:', err);
-        return null;
+function resetPreview() {
+    if (!jetPreview) return;
+    if (selectedCard) setPreviewFromCard(selectedCard);
+    else {
+        jetPreview.src = PLACEHOLDER_SRC;
+        jetPreview.alt = 'No jet selected';
     }
 }
 
-document.addEventListener('DOMContentLoaded', () => {
-    fetchJetData();
-});
+// Selection
+function selectCard(card) {
+    if (!card) return;
+    if (selectedCard) selectedCard.classList.remove('is-selected');
+    card.classList.add('is-selected');
+    selectedCard = card;
+    selectedJet = card.dataset.jet || null;
+    setPreviewFromCard(card);
+    updateStartButtonState();
+}
+
+function deselectCard() {
+    if (selectedCard) selectedCard.classList.remove('is-selected');
+    selectedCard = null;
+    selectedJet = null;
+    resetPreview();
+    updateStartButtonState();
+}
+
+// ---------- Event delegation for CLICK + KEYBOARD ----------
+function setupJetSelection() {
+    if (!grid) return;
+
+    // Click to select / re-click to deselect
+    grid.addEventListener('click', (e) => {
+        const card = e.target.closest('.jet-card');
+        if (!card || !grid.contains(card)) return;
+
+        if (selectedCard === card) {
+            deselectCard();
+        } else {
+            selectCard(card);
+        }
+    });
+
+    // Keyboard: Enter/Space on focused card
+    grid.addEventListener('keydown', (e) => {
+        const card = e.target.closest('.jet-card');
+        if (!card || !grid.contains(card)) return;
+
+        if (e.key === 'Enter' || e.code === 'Space') {
+            e.preventDefault();
+            card.click(); // reuse click logic
+        }
+    });
+
+    // Hover preview (mouseover/mouseout bubble; handle relatedTarget for true leave)
+    grid.addEventListener('mouseover', (e) => {
+        const card = e.target.closest('.jet-card');
+        if (!card || !grid.contains(card)) return;
+        setPreviewFromCard(card);
+    });
+    grid.addEventListener('mouseout', (e) => {
+        const leavingCard = e.target.closest('.jet-card');
+        if (!leavingCard || !grid.contains(leavingCard)) return;
+
+        const toEl = e.relatedTarget;
+        const stillInsideSameCard = leavingCard.contains(toEl);
+        const movedOntoAnotherCard = toEl && toEl.closest && toEl.closest('.jet-card');
+
+        if (stillInsideSameCard) return; // ignore child transitions
+        if (movedOntoAnotherCard) return; // mouseover handler will set preview
+
+        // Truly left all cards—restore selection or placeholder
+        resetPreview();
+    });
+
+    // Name input updates Start state
+    if (nameInput) {
+        nameInput.addEventListener('input', updateStartButtonState);
+    }
+
+    // Start button -> server session + redirect
+    if (startBtn) {
+        startBtn.addEventListener('click', async () => {
+            console.log(selectedJet);
+
+            // Extra guard
+            if (!selectedJet || !nameInput || !nameInput.value.trim()) return;
+
+            try {
+                const res = await fetch('/session/start', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: nameInput.value.trim(), jet: selectedJet }),
+                });
+                const data = await res.json();
+                if (res.ok && data.ok) {
+                    window.location.href = '/game';
+                } else {
+                    alert(data.error || 'Could not start game session.');
+                }
+            } catch (err) {
+                console.error(err);
+                alert('Network error starting session.');
+            }
+        });
+    }
+}
+
+// --------- Build grid from API then enable interactions ----------
+async function fetchJetData() {
+    try {
+        const response = await fetch('/API/jets.json', {
+            headers: { 'Accept': 'application/json' },
+            cache: 'no-cache',
+        });
+        if (!response.ok) throw new Error(`HTTP ${response.status} - ${response.statusText}`);
+        const data = await response.json();
+        addJets(data); // builds DOM
+        setupJetSelection(); // wire events after DOM exists
+    } catch (err) {
+        console.error('Error fetching JSON:', err);
+    }
+}
+
+function addJets(jetData) {
+    const jets = Array.isArray(jetData?.Jets) ? jetData.Jets : [];
+    const gridEl = document.querySelector('.jet-grid');
+    if (!gridEl) return;
+
+    const frag = document.createDocumentFragment();
+
+    jets.forEach(jet => {
+        const code = jet['ID'] || 'N/A';
+        const name = jet['Name'] || 'Unknown Jet';
+        const iconPath = jet['Icon'] ? `/Images/JetIcons/${jet['Icon']}` : '/Images/placeholder-jet.jpg';
+
+        const btn = document.createElement('button');
+        btn.className = 'jet-card';
+        btn.type = 'button';
+        btn.dataset.jet = code;
+
+        const img = document.createElement('img');
+        img.src = iconPath;
+        img.alt = name;
+
+        const span = document.createElement('span');
+        span.textContent = name;
+
+        btn.appendChild(img);
+        btn.appendChild(span);
+        frag.appendChild(btn);
+    });
+
+    gridEl.appendChild(frag);
+}
+
+document.addEventListener('DOMContentLoaded', fetchJetData);

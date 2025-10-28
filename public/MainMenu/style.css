@@ -99,3 +99,13 @@ div {
     /* subtle depth */
     transition: transform 0.2s ease, box-shadow 0.2s ease;
 }
+
+#start-btn:disabled {
+    opacity: 0.5;
+    pointer-events: none;
+    transition: opacity 0.3s ease;
+}
+
+#start-btn {
+    transition: opacity 0.3s ease;
+}

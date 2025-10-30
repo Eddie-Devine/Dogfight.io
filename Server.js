@@ -55,6 +55,7 @@ app.get('/game', requireSession, (req, res) => {
 	res.sendFile(path.join(__dirname, 'public', 'Game', 'index.html'));
 });
 
+// Serve main menu and prevent 404
 app.use('/MainMenu', express.static(path.join(__dirname, 'public', 'MainMenu'), { maxAge: '1d' }));
 
 // Serve static files from public directory

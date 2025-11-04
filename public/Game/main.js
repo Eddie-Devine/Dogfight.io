@@ -14,28 +14,23 @@
 
     // --- Sprite preload ---
     const jetSprite = new Image();
-    jetSprite.src = '/Images/placeholder_player.png'; // <-- your file path
+    jetSprite.src = '/Images/placeholder_player.png';
     let jetReady = false;
     jetSprite.onload = () => { jetReady = true; };
-
 
     function resize() {
         cw = world.clientWidth;
         ch = world.clientHeight;
-        dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2)); // cap DPR if you like
+        dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 2));
 
         vw = Math.floor(cw * dpr);
         vh = Math.floor(ch * dpr);
 
-        // size both canvases
         for (const c of [world, hud]) {
-            c.width = vw; c.height = vh;  // backing store in device px
-            c.style.width = cw + 'px';     // CSS size
+            c.width = vw; c.height = vh;
+            c.style.width = cw + 'px';
             c.style.height = ch + 'px';
         }
-
-        // draw at CSS pixel units: scale once, per frame we’ll reset + apply transforms
-        // (we'll always start frames with ctx.setTransform(dpr,0,0,dpr,0,0))
     }
     window.addEventListener('resize', resize, { passive: true });
     resize();
@@ -51,24 +46,18 @@
         targetSpeed: 14,
         minSpeed: 6,
         maxSpeed: 40,
-        accel: 30,               // how quickly W/S changes speed
-        // turning via radius (smaller radius = tighter turns)
-        minRadius: 7,            // tightest possible turn
-        maxRadius: 120,          // straight-ish flight
-        turnDemand: 0,           // -1..+1 (set by mouse movement)
-        turnDecay: 2.5,          // returns demand toward 0 when mouse stops (per second)
-        rollSway: 0,             // visual bank angle for HUD sprite
+        accel: 30,
+        minRadius: 7,
+        maxRadius: 120,
+        turnDemand: 0,           // [-1..+1]
+        turnDecay: 2.5,          // (unused without pointer lock, OK to keep)
+        rollSway: 0,
     };
 
-    // Camera follows the player; same world view regardless of monitor size.
-    const camera = {
-        x: 0, y: 0,
-        stiffness: 6.0,   // spring toward player
-        // zoom could be dynamic per HUD if you want—keep fixed here for consistent feel.
-    };
+    const camera = { x: 0, y: 0, stiffness: 6.0 };
 
     // ============================================================
-    // Input: W/S speed, mouse movement => turnDemand
+    // Input: W/S speed, mouse X => turnDemand
     // ============================================================
     const keys = new Set();
     window.addEventListener('keydown', (e) => {
@@ -76,35 +65,23 @@
         if (e.code === 'KeyW' || e.code === 'KeyS') e.preventDefault();
         keys.add(e.code);
     });
-    window.addEventListener('keyup', (e) => {
-        keys.delete(e.code);
-    });
+    window.addEventListener('keyup', (e) => { keys.delete(e.code); });
 
-    // Pointer lock (optional but makes "mouse movement controls turn" feel great)
-    world.addEventListener('click', () => {
-        if (document.pointerLockElement !== world) world.requestPointerLock();
-    });
-    document.addEventListener('pointerlockchange', () => {
-        // no-op; we read movementX when locked; otherwise we infer from cursor position
-    });
-
-    // Turn control: movementX (locked) accumulates into [-1,1].
+    // NO pointer-lock — mapping is from cursor X relative to center
     let mouse = { x: cw / 2, y: ch / 2 };
     window.addEventListener('mousemove', (e) => {
-        if (document.pointerLockElement === world) {
-            // scale movement into demand; tune sensitivity as needed
-            const sens = 0.0035; // demand per px moved
-            player.turnDemand = clamp(player.turnDemand + e.movementX * sens, -1, 1);
-        } else {
-            // Without pointer lock, infer demand from cursor distance from center (x only)
-            mouse.x = e.clientX;
-            const centerX = cw * 0.5;
-            const t = clamp((mouse.x - centerX) / (centerX), -1, 1);
-            player.turnDemand = t;
-        }
+        mouse.x = e.clientX;
+        const centerX = cw * 0.5;
+        const t = clamp((mouse.x - centerX) / (centerX), -1, 1);
+        player.turnDemand = t;
+        uiTarget = t; // HUD knob mirrors the same value
     }, { passive: true });
 
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+    // HUD turn knob smoothing (UI-only)
+    let uiTurn = 0;      // what we draw
+    let uiTarget = 0;    // desired knob position
 
     // ============================================================
     // Fixed-timestep simulation
@@ -119,21 +96,18 @@
         last = now;
         acc = Math.min(MAX_ACC, acc + dt);
 
-        // --- input -> target speed
+        // input -> target speed
         if (keys.has('KeyW')) player.targetSpeed = Math.min(player.maxSpeed, player.targetSpeed + player.accel * dt);
         if (keys.has('KeyS')) player.targetSpeed = Math.max(player.minSpeed, player.targetSpeed - player.accel * dt);
-
-        // decay turn demand toward 0 (only when pointer-locked; without lock, we continuously map cursor X)
-        if (document.pointerLockElement === world) {
-            const sign = Math.sign(player.turnDemand);
-            const mag = Math.max(0, Math.abs(player.turnDemand) - player.turnDecay * dt);
-            player.turnDemand = sign * mag;
-        }
 
         while (acc >= FIXED_DT) {
             step(FIXED_DT);
             acc -= FIXED_DT;
         }
+
+        // ease the HUD knob toward live demand
+        const uiEase = 12;
+        uiTurn += (uiTarget - uiTurn) * (1 - Math.exp(-uiEase * dt));
 
         render();
         requestAnimationFrame(loop);
@@ -145,24 +119,26 @@
         const ds = player.targetSpeed - player.speed;
         player.speed += clamp(ds, -player.accel * dt, player.accel * dt);
 
-        // map demand (-1..1) to a radius [maxRadius..minRadius]
-        const demand = player.turnDemand;
+        // turn radius mapping
+        const demand = player.turnDemand;                // [-1..1]
         const ad = Math.abs(demand);
-        const radius = lerp(player.maxRadius, player.minRadius, ad); // smaller radius = tighter turn
+        let radius; //the radius the jet turns at 
+        const playerT = Math.max(-1, Math.min(1, uiTurn)).toFixed(2); //the turn demand shown to the player on the HUD
+        if(Math.abs(playerT) == 0){ //if the user says 0 turn demand
+            radius = Infinity; //turn radius is a straight line
+        }
+        else{
+            radius = lerp(player.maxRadius, player.minRadius, ad); //map the turn demand to the turn radius
+        }
         const turnDir = Math.sign(demand) || 0;
         const omega = (turnDir === 0 || ad < 1e-4) ? 0 : (player.speed / radius) * turnDir; // rad/s
 
         // integrate heading and position
         player.heading += omega * dt;
 
-        // forward vector from heading
-        // const vx = Math.cos(player.heading);
-        // const vy = Math.sin(player.heading);
-
         // Aviation-style: 0° = North (negative Y)
         const vx = Math.sin(player.heading);
         const vy = -Math.cos(player.heading);
-
 
         player.pos.x += vx * player.speed * dt;
         player.pos.y += vy * player.speed * dt;
@@ -173,7 +149,7 @@
         camera.x += cx * (1 - Math.exp(-camera.stiffness * dt));
         camera.y += cy * (1 - Math.exp(-camera.stiffness * dt));
 
-        // visual roll sway for HUD sprite (bank into the turn)
+        // visual roll sway for HUD sprite
         const targetSway = clamp(-turnDir * ad, -1, 1);
         player.rollSway += (targetSway - player.rollSway) * (1 - Math.exp(-8 * dt));
     }
@@ -184,15 +160,13 @@
     // Rendering
     // ============================================================
     function render() {
-        // reset transforms into CSS pixel space
         wctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         hctx.setTransform(dpr, 0, 0, dpr, 0, 0);
 
-        // clear
         wctx.clearRect(0, 0, cw, ch);
         hctx.clearRect(0, 0, cw, ch);
 
-        // WORLD transform: center screen at camera, scale world->pixels by PPU
+        // WORLD
         wctx.save();
         wctx.translate(cw * 0.5, ch * 0.5);
         wctx.scale(PPU, PPU);
@@ -201,17 +175,12 @@
         drawGrid(wctx);
         drawPlayer(wctx, player);
 
-        // (later) draw other players using the same world transform
-        // e.g., for (const p of others) drawPlayer(wctx, p);
-
         wctx.restore();
 
         drawHUD(hctx);
     }
 
     function drawGrid(ctx) {
-        // The grid is defined in world units and rendered relative to camera,
-        // so it’s stable across all DPIs and screen sizes.
         const gap = GRID.gap;
         const halfW = (cw * 0.5) / PPU;
         const halfH = (ch * 0.5) / PPU;
@@ -250,17 +219,14 @@
     }
 
     function drawPlayer(ctx, p) {
-        // Desired size in WORLD UNITS (same numbers you used before)
-        const L = 4.0 * 10;   // fuselage length (world units)
-        const W = 3.2 * 10;   // wingspan/width (world units)
+        const L = 4.0 * 10;   // fuselage length (WU)
+        const W = 3.2 * 10;   // wingspan/width (WU)
 
         ctx.save();
         ctx.translate(p.pos.x, p.pos.y);
-
-        // heading + bank sway
         ctx.rotate(p.heading + p.rollSway * 0.3);
 
-        // --- Shadow (keep from your vector version, scaled to L/W) ---
+        // shadow
         ctx.save();
         ctx.globalAlpha = 0.25;
         ctx.fillStyle = '#000';
@@ -269,44 +235,37 @@
         ctx.fill();
         ctx.restore();
 
-        // --- Draw sprite (in WORLD units; camera transform will scale by PPU) ---
         if (jetReady) {
-            // Optional: crisp vs smooth. Set false for pixel-art.
             ctx.imageSmoothingEnabled = true;
-
             ctx.save();
-
-            // Anchor sprite at its center
             const x = -W * 0.5;
             const y = -L * 0.5;
-            ctx.drawImage(jetSprite, x, y, W, L); // width=W, height=L (WU)
+            ctx.drawImage(jetSprite, x, y, W, L);
             ctx.restore();
         } else {
-            // Fallback: your original vector glyph until the image loads
+            // fallback vector jet
             ctx.fillStyle = '#7fb2ff';
             ctx.strokeStyle = '#d2e8ff';
             ctx.lineWidth = 1.2 / PPU;
 
             ctx.beginPath();
-            ctx.moveTo(L * 0.55, 0);               // nose
-            ctx.lineTo(0, W * 0.55);              // right wing tip
-            ctx.lineTo(-L * 0.3, W * 0.25);           // right wing root
-            ctx.lineTo(-L * 0.65, 0.12);            // tail right
-            ctx.lineTo(-L * 0.85, 0);               // tail
-            ctx.lineTo(-L * 0.65, -0.12);            // tail left
-            ctx.lineTo(-L * 0.3, -W * 0.25);           // left wing root
-            ctx.lineTo(0, -W * 0.55);              // left wing tip
+            ctx.moveTo(L * 0.55, 0);
+            ctx.lineTo(0, W * 0.55);
+            ctx.lineTo(-L * 0.3, W * 0.25);
+            ctx.lineTo(-L * 0.65, 0.12);
+            ctx.lineTo(-L * 0.85, 0);
+            ctx.lineTo(-L * 0.65, -0.12);
+            ctx.lineTo(-L * 0.3, -W * 0.25);
+            ctx.lineTo(0, -W * 0.55);
             ctx.closePath();
             ctx.fill();
             ctx.stroke();
 
-            // canopy
             ctx.fillStyle = '#1a324a';
             ctx.beginPath();
             ctx.ellipse(L * 0.15, 0, L * 0.18, L * 0.10, 0, 0, Math.PI * 2);
             ctx.fill();
 
-            // nose sparkle
             ctx.fillStyle = 'rgba(255,255,255,0.75)';
             ctx.beginPath();
             ctx.arc(L * 0.48, 0, 0.06, 0, Math.PI * 2);
@@ -316,14 +275,12 @@
         ctx.restore();
     }
 
-
     function drawHUD(ctx) {
-        // simple HUD overlay in screen space (CSS px)
+        // top-left info panel
         const pad = 14;
         const boxW = 230;
         const lineH = 18;
 
-        // panel
         ctx.save();
         ctx.translate(pad, pad);
         roundedRect(ctx, 0, 0, boxW, 96, 10);
@@ -344,10 +301,9 @@
 
         let y = 10;
         ctx.fillText(`SPD: ${speed.toFixed(1)} u/s`, 12, y); y += lineH;
-        ctx.fillText(`HDG: ${hdgDeg.toFixed(0)}°`, 12, y); y+= lineH;
+        ctx.fillText(`HDG: ${hdgDeg.toFixed(0)}°`, 12, y); y += lineH;
         ctx.fillText(`TURN R: ${radius.toFixed(1)} u`, 12, y); y += lineH;
         ctx.fillText(`Ω: ${(omega * 180 / Math.PI).toFixed(2)} °/s`, 12, y);
-
         ctx.restore();
 
         // center reticle
@@ -364,16 +320,83 @@
         ctx.stroke();
         ctx.restore();
 
-        // bottom bar (future: net stats, player name, etc.)
+        // Bottom turn-demand bar with moving knob (centered, fractional width)
         ctx.save();
-        const barH = 26;
-        roundedRect(ctx, 12, ch - barH - 12, cw - 24, barH, 10);
+
+        const trackH = 18;
+        const knobR = 10;
+        const padY = 12;
+
+        const panelY = ch - (trackH + 20) - padY; // box height = trackH + 20
+        const panelH = trackH + 20;
+
+        const barFraction = 0.5;   // 50% of screen width
+        const panelW = cw * barFraction;
+        const panelX = (cw - panelW) * 0.5;
+
+        // panel background
+        roundedRect(ctx, panelX, panelY, panelW, panelH, 10);
         ctx.fillStyle = 'rgba(0,0,0,0.35)';
         ctx.fill();
+
+        // track geometry
+        const trackW = cw * barFraction;
+        const trackX = (cw - trackW) * 0.5;   // centered
+        const trackY = panelY + (panelH - trackH) / 2;
+
+        // track line
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(160,200,230,0.5)';
+        ctx.beginPath();
+        ctx.moveTo(trackX, trackY + trackH / 2);
+        ctx.lineTo(trackX + trackW, trackY + trackH / 2);
+        ctx.stroke();
+
+        // center tick
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(160,200,230,0.5)';
+        ctx.beginPath();
+        const cx = trackX + trackW * 0.5;
+        ctx.moveTo(cx, trackY + 4);
+        ctx.lineTo(cx, trackY + trackH - 4);
+        ctx.stroke();
+
+        // labels
+        ctx.fillStyle = 'rgba(169,197,222,0.85)';
         ctx.font = '12px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
-        ctx.fillStyle = '#a9c5de';
-        ctx.textBaseline = 'middle';
-        ctx.fillText('DOGFIGHT.IO — local sandbox • networking hooks ready', 22, ch - barH / 2 - 12 + barH / 2);
+        ctx.textBaseline = 'alphabetic';
+        ctx.textAlign = 'left';
+        ctx.fillText('L', trackX, trackY - 4);
+        ctx.textAlign = 'right';
+        ctx.fillText('R', trackX + trackW, trackY - 4);
+
+        // knob position from uiTurn [-1..+1]
+        const t = Math.max(-1, Math.min(1, uiTurn));
+        const knobX = trackX + (t + 1) * 0.5 * trackW;
+        const knobY = trackY + trackH / 2;
+
+        // knob glow
+        ctx.beginPath();
+        ctx.arc(knobX, knobY, knobR + 6, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(120,200,255,0.15)';
+        ctx.fill();
+
+        // knob circle
+        ctx.beginPath();
+        ctx.arc(knobX, knobY, knobR, 0, Math.PI * 2);
+        ctx.fillStyle = 'rgba(190,235,255,0.95)';
+        ctx.fill();
+        ctx.lineWidth = 2;
+        ctx.strokeStyle = 'rgba(60,130,180,0.9)';
+        ctx.stroke();
+
+        // optional numeric readout
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'top';
+        ctx.fillStyle = 'rgba(169,197,222,0.9)';
+        ctx.font = '11px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        ctx.fillText(`TURN INPUT: ${t.toFixed(2)}`, knobX, knobY + knobR + 6);
+
         ctx.restore();
     }
 
@@ -388,22 +411,8 @@
     }
 
     function wrapAngle(a) {
-        // wrap to [-PI, PI)
         a = (a + Math.PI) % (Math.PI * 2);
         if (a < 0) a += Math.PI * 2;
         return a - Math.PI;
     }
-
-    // ============================================================
-    // Networking Hooks (stubbed for later)
-    // ============================================================
-    // You’ll broadcast/receive world-space states like:
-    // {
-    //   id, pos:{x,y}, heading, speed, timestamp
-    // }
-    // Then:
-    // - Interpolate remote players at render time.
-    // - Keep all physics in world units; never in screen pixels.
-    // - Don’t send screen size; it’s irrelevant with this camera model.
-    // - Consider a fixed tick + client-side prediction for your own jet.
 })();

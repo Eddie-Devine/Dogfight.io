@@ -45,10 +45,10 @@
         speed: 14,               // world units / second
         targetSpeed: 14,
         minSpeed: 6,
-        maxSpeed: 40,
+        maxSpeed: 300,
         accel: 30,
-        minRadius: 7,
-        maxRadius: 120,
+        minRadius: 50,
+        maxRadius: 170,
         turnDemand: 0,           // [-1..+1]
         turnDecay: 2.5,          // (unused without pointer lock, OK to keep)
         rollSway: 0,
@@ -67,15 +67,25 @@
     });
     window.addEventListener('keyup', (e) => { keys.delete(e.code); });
 
-    // NO pointer-lock — mapping is from cursor X relative to center
     let mouse = { x: cw / 2, y: ch / 2 };
     window.addEventListener('mousemove', (e) => {
         mouse.x = e.clientX;
         const centerX = cw * 0.5;
-        const t = clamp((mouse.x - centerX) / (centerX), -1, 1);
+
+        // raw input from -1 to +1
+        const raw = (mouse.x - centerX) / centerX;
+
+        // curve it so it's softer near center but still reaches ±1 at the edges
+        const expo = 1.4; // try 1.2–1.8; higher = softer center
+        const curved = Math.sign(raw) * Math.pow(Math.abs(raw), expo);
+
+        // final clamped turn demand
+        const t = clamp(curved, -1, 1);
+
         player.turnDemand = t;
         uiTarget = t; // HUD knob mirrors the same value
     }, { passive: true });
+
 
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
@@ -119,19 +129,21 @@
         const ds = player.targetSpeed - player.speed;
         player.speed += clamp(ds, -player.accel * dt, player.accel * dt);
 
-        // turn radius mapping
-        const demand = player.turnDemand;                // [-1..1]
+        // --- turn radius mapping (physics truth with a tiny deadzone) ---
+        let demand = player.turnDemand;                 // [-1..1]
+        const tDisplay = Math.max(-1, Math.min(1, uiTurn)); // smoothed, numeric
+        const showZero = Math.abs(tDisplay) < 0.005;        // same as "0.00" on HUD
+
+        // If HUD would show 0.00, fly truly straight
+        if (showZero) demand = 0;
+
         const ad = Math.abs(demand);
-        let radius; //the radius the jet turns at 
-        const playerT = Math.max(-1, Math.min(1, uiTurn)).toFixed(2); //the turn demand shown to the player on the HUD
-        if(Math.abs(playerT) == 0){ //if the user says 0 turn demand
-            radius = Infinity; //turn radius is a straight line
-        }
-        else{
-            radius = lerp(player.maxRadius, player.minRadius, ad); //map the turn demand to the turn radius
-        }
         const turnDir = Math.sign(demand) || 0;
-        const omega = (turnDir === 0 || ad < 1e-4) ? 0 : (player.speed / radius) * turnDir; // rad/s
+
+        // radius & turn rate
+        const radius = (ad === 0) ? Infinity : lerp(player.maxRadius, player.minRadius, ad);
+        const omega = (turnDir === 0) ? 0 : (player.speed / radius) * turnDir; // rad/s
+
 
         // integrate heading and position
         player.heading += omega * dt;
@@ -275,42 +287,148 @@
         ctx.restore();
     }
 
-    function drawHUD(ctx) {
-        // top-left info panel
+    function drawSpeedBar(ctx) {
+        // pull from global player
+        const speed = player.speed;
+        const minSpeed = player.minSpeed;
+        const maxSpeed = player.maxSpeed;
+
+        // layout
+        const padEdge = 14;                 // distance from left screen edge
+        const panelW = 80;                 // overall panel width og 64
+        const trackW = 18;                 // bar width
+        const barH = Math.min(260, ch - 2 * 80); // bar height; clamp so it looks nice
+        const panelH = barH + 36;
+
+        // vertically center the panel (keeps clear of your top-left info box)
+        const panelX = padEdge;
+        const panelY = (ch - panelH) * 0.5;
+
+        ctx.save();
+
+        // panel
+        roundedRect(ctx, panelX, panelY, panelW, panelH, 10);
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.fill();
+
+        // track rect inside panel
+        const trackX = panelX + (panelW - trackW) * 0.5;
+        const trackY = panelY + 12;
+
+        // track background
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(160,200,230,0.35)';
+        ctx.fillStyle = 'rgba(255,255,255,0.06)';
+        ctx.beginPath();
+        ctx.rect(trackX, trackY, trackW, barH);
+        ctx.fill();
+        ctx.stroke();
+
+        // normalize speed -> [0,1] with safe denom
+        const denom = Math.max(1e-6, maxSpeed - minSpeed);
+        const t = clamp((speed - minSpeed) / denom, 0, 1);
+
+        // filled column from bottom up
+        const fillH = barH * t;
+        ctx.fillStyle = 'rgba(120,200,255,0.35)';
+        ctx.fillRect(trackX + 1, trackY + (barH - fillH), trackW - 2, fillH);
+
+        // current speed marker line
+        ctx.strokeStyle = 'rgba(168,230,255,0.9)';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        const yMark = trackY + (barH - fillH);
+        ctx.moveTo(trackX - 6, yMark);
+        ctx.lineTo(trackX + trackW + 6, yMark);
+        ctx.stroke();
+
+        // ticks & labels (every 5 units)
+        ctx.fillStyle = 'rgba(169,197,222,0.85)';
+        ctx.strokeStyle = 'rgba(160,200,230,0.5)';
+        ctx.font = '11px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        ctx.textAlign = 'left';
+        ctx.textBaseline = 'middle';
+
+        const step = 20;
+        const vMin = Math.ceil(minSpeed / step) * step;
+        const vMax = Math.floor(maxSpeed / step) * step;
+        for (let v = vMin; v <= vMax; v += step) {
+            const tv = clamp((v - minSpeed) / denom, 0, 1);
+            const y = trackY + (barH - tv * barH);
+            // tick
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(trackX + trackW + 4, y);
+            ctx.lineTo(trackX + trackW + 10, y);
+            ctx.stroke();
+            // label
+            ctx.fillText(String(v), trackX + trackW + 12, y);
+        }
+
+        // numeric readout
+        // ctx.textAlign = 'center';
+        // ctx.textBaseline = 'top';
+        // ctx.fillStyle = 'rgba(169,197,222,0.95)';
+        // ctx.font = '12px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        //ctx.fillText(`SPD ${speed.toFixed(1)}`, panelX + panelW / 2, panelY + 4);
+
+        ctx.restore();
+    }
+
+    function drawInfoPanel(ctx) {
         const pad = 14;
         const boxW = 230;
         const lineH = 18;
 
         ctx.save();
         ctx.translate(pad, pad);
+
+        // panel box
         roundedRect(ctx, 0, 0, boxW, 96, 10);
         ctx.fillStyle = 'rgba(0,0,0,0.35)';
         ctx.strokeStyle = 'rgba(255,255,255,0.10)';
         ctx.fill();
         ctx.stroke();
 
+        // text style
         ctx.fillStyle = '#a9c5de';
         ctx.font = '12px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
         ctx.textBaseline = 'top';
 
+        // compute values (keep HUD consistent with physics)
         const speed = player.speed;
-        const demand = player.turnDemand;
-        const radius = lerp(player.maxRadius, player.minRadius, Math.abs(demand));
-        const omega = (Math.abs(demand) < 1e-4) ? 0 : (speed / radius);
-        const hdgDeg = ((player.heading * 180 / Math.PI) % 360 + 360) % 360; // 0..359, 0°=North
+        const hdgDeg = ((player.heading * 180 / Math.PI) % 360 + 360) % 360;
 
+        const tDisplay = Math.max(-1, Math.min(1, uiTurn));
+        const showZero = Math.abs(tDisplay) < 0.005;
+
+        let radiusHUD, omegaHUD;
+        if (showZero) {
+            radiusHUD = Infinity;
+            omegaHUD = 0;
+        } else {
+            const ad = Math.abs(player.turnDemand);
+            const r = lerp(player.maxRadius, player.minRadius, ad);
+            radiusHUD = r;
+            omegaHUD = speed / r;
+        }
+
+        // lines
         let y = 10;
         ctx.fillText(`SPD: ${speed.toFixed(1)} u/s`, 12, y); y += lineH;
         ctx.fillText(`HDG: ${hdgDeg.toFixed(0)}°`, 12, y); y += lineH;
-        ctx.fillText(`TURN R: ${radius.toFixed(1)} u`, 12, y); y += lineH;
-        ctx.fillText(`Ω: ${(omega * 180 / Math.PI).toFixed(2)} °/s`, 12, y);
-        ctx.restore();
+        ctx.fillText(`TURN R: ${Number.isFinite(radiusHUD) ? radiusHUD.toFixed(1) + ' u' : '∞'}`, 12, y); y += lineH;
+        ctx.fillText(`Ω: ${(omegaHUD * 180 / Math.PI).toFixed(2)} °/s`, 12, y);
 
-        // center reticle
+        ctx.restore();
+    }
+
+    function drawCenterReticle(ctx) {
         ctx.save();
         ctx.translate(cw * 0.5, ch * 0.5);
         ctx.strokeStyle = 'rgba(168, 230, 255, 0.6)';
         ctx.lineWidth = 1;
+
         ctx.beginPath();
         ctx.arc(0, 0, 10, 0, Math.PI * 2);
         ctx.moveTo(-16, 0); ctx.lineTo(-6, 0);
@@ -318,9 +436,11 @@
         ctx.moveTo(0, -16); ctx.lineTo(0, -6);
         ctx.moveTo(0, 16); ctx.lineTo(0, 6);
         ctx.stroke();
-        ctx.restore();
 
-        // Bottom turn-demand bar with moving knob (centered, fractional width)
+        ctx.restore();
+    }
+
+    function drawTurnDemandBar(ctx) {
         ctx.save();
 
         const trackH = 18;
@@ -330,7 +450,7 @@
         const panelY = ch - (trackH + 20) - padY; // box height = trackH + 20
         const panelH = trackH + 20;
 
-        const barFraction = 0.5;   // 50% of screen width
+        const barFraction = 0.5;                 // 50% of screen width
         const panelW = cw * barFraction;
         const panelX = (cw - panelW) * 0.5;
 
@@ -341,7 +461,7 @@
 
         // track geometry
         const trackW = cw * barFraction;
-        const trackX = (cw - trackW) * 0.5;   // centered
+        const trackX = (cw - trackW) * 0.5;      // centered
         const trackY = panelY + (panelH - trackH) / 2;
 
         // track line
@@ -356,9 +476,9 @@
         ctx.lineWidth = 1;
         ctx.strokeStyle = 'rgba(160,200,230,0.5)';
         ctx.beginPath();
-        const cx = trackX + trackW * 0.5;
-        ctx.moveTo(cx, trackY + 4);
-        ctx.lineTo(cx, trackY + trackH - 4);
+        const cxLine = trackX + trackW * 0.5;
+        ctx.moveTo(cxLine, trackY + 4);
+        ctx.lineTo(cxLine, trackY + trackH - 4);
         ctx.stroke();
 
         // labels
@@ -390,7 +510,7 @@
         ctx.strokeStyle = 'rgba(60,130,180,0.9)';
         ctx.stroke();
 
-        // optional numeric readout
+        // numeric readout
         ctx.textAlign = 'center';
         ctx.textBaseline = 'top';
         ctx.fillStyle = 'rgba(169,197,222,0.9)';
@@ -398,6 +518,16 @@
         ctx.fillText(`TURN INPUT: ${t.toFixed(2)}`, knobX, knobY + knobR + 6);
 
         ctx.restore();
+    }
+
+    function drawHUD(ctx) {
+        // draw left speed bar first so other panels can overlap if needed
+        drawSpeedBar(ctx);
+
+        // core HUD elements
+        drawInfoPanel(ctx);
+        drawCenterReticle(ctx);
+        drawTurnDemandBar(ctx);
     }
 
     function roundedRect(ctx, x, y, w, h, r) {

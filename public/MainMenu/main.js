@@ -161,7 +161,7 @@ function addJets(jetData) {
     jets.forEach(jet => {
         const code = jet['ID'] || 'N/A';
         const name = jet['Name'] || 'Unknown Jet';
-        const iconPath = jet['Icon'] ? `/Images/JetIcons/${jet['Icon']}` : '/Images/placeholder-jet.jpg';
+        const iconPath = `/Assets/${code}/Icon.png`
 
         const btn = document.createElement('button');
         btn.className = 'jet-card';

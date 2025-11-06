@@ -4,15 +4,13 @@
             "Name": "F-22 Raptor",
             "Full Name": "Lockheed Martin F-22 Raptor",
             "Nation": "USA",
-            "ID": "F22",
-            "Icon": "F22.png"
+            "ID": "F22"
         },
         {
-            "Name": "F-15 Eagle",
-            "Full Name": "McDonnell Douglas F-15EX Eagle II",
+            "Name": "F-16 Viper",
+            "Full Name": "General Dynamics F-16 Fighting Falcon",
             "Nation": "USA",
-            "ID": "F15",
-            "Icon": "F15.png"
+            "ID": "F16"
         }
     ]
 }

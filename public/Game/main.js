@@ -14,7 +14,7 @@
 
     // --- Sprite preload ---
     const jetSprite = new Image();
-    jetSprite.src = '/Images/placeholder_player.png';
+    jetSprite.src = '/Assets/placeholder_player.png';
     let jetReady = false;
     jetSprite.onload = () => { jetReady = true; };
 
@@ -87,7 +87,26 @@
     }, { passive: true });
 
 
+    //Helpter functions
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+
+    function lerp(a, b, t) { return a + (b - a) * t; }
+
+    function wrapAngle(a) {
+        a = (a + Math.PI) % (Math.PI * 2);
+        if (a < 0) a += Math.PI * 2;
+        return a - Math.PI;
+    }
+
+    function roundedRect(ctx, x, y, w, h, r) {
+        ctx.beginPath();
+        ctx.moveTo(x + r, y);
+        ctx.arcTo(x + w, y, x + w, y + h, r);
+        ctx.arcTo(x + w, y + h, x, y + h, r);
+        ctx.arcTo(x, y + h, x, y, r);
+        ctx.arcTo(x, y, x + w, y, r);
+        ctx.closePath();
+    }
 
     // HUD turn knob smoothing (UI-only)
     let uiTurn = 0;      // what we draw
@@ -166,8 +185,6 @@
         player.rollSway += (targetSway - player.rollSway) * (1 - Math.exp(-8 * dt));
     }
 
-    function lerp(a, b, t) { return a + (b - a) * t; }
-
     // ============================================================
     // Rendering
     // ============================================================
@@ -231,61 +248,33 @@
     }
 
     function drawPlayer(ctx, p) {
-        const L = 4.0 * 10;   // fuselage length (WU)
-        const W = 3.2 * 10;   // wingspan/width (WU)
+        // Size in WORLD units (not pixels). Tweak as you like.
+        const L = 4.0 * 10;   // length
+        const W = 3.2 * 10;   // width
+
+        if (!jetReady) return; // don't draw until the image is loaded
 
         ctx.save();
+
+        // Move to player position (world space), rotate by heading + visual roll
         ctx.translate(p.pos.x, p.pos.y);
         ctx.rotate(p.heading + p.rollSway * 0.3);
 
-        // shadow
-        ctx.save();
-        ctx.globalAlpha = 0.25;
-        ctx.fillStyle = '#000';
-        ctx.beginPath();
-        ctx.ellipse(0.1, 0.3, W * 0.55, L * 0.18, 0, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.restore();
+        // If your art points UP by default and 0° = North (your sim),
+        // no extra offset is needed. If your art points RIGHT, add:
+        // ctx.rotate(-Math.PI / 2);
 
-        if (jetReady) {
-            ctx.imageSmoothingEnabled = true;
-            ctx.save();
-            const x = -W * 0.5;
-            const y = -L * 0.5;
-            ctx.drawImage(jetSprite, x, y, W, L);
-            ctx.restore();
-        } else {
-            // fallback vector jet
-            ctx.fillStyle = '#7fb2ff';
-            ctx.strokeStyle = '#d2e8ff';
-            ctx.lineWidth = 1.2 / PPU;
+        // For crisp vector art leave smoothing on; for pixel art set false
+        ctx.imageSmoothingEnabled = true;
 
-            ctx.beginPath();
-            ctx.moveTo(L * 0.55, 0);
-            ctx.lineTo(0, W * 0.55);
-            ctx.lineTo(-L * 0.3, W * 0.25);
-            ctx.lineTo(-L * 0.65, 0.12);
-            ctx.lineTo(-L * 0.85, 0);
-            ctx.lineTo(-L * 0.65, -0.12);
-            ctx.lineTo(-L * 0.3, -W * 0.25);
-            ctx.lineTo(0, -W * 0.55);
-            ctx.closePath();
-            ctx.fill();
-            ctx.stroke();
-
-            ctx.fillStyle = '#1a324a';
-            ctx.beginPath();
-            ctx.ellipse(L * 0.15, 0, L * 0.18, L * 0.10, 0, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.fillStyle = 'rgba(255,255,255,0.75)';
-            ctx.beginPath();
-            ctx.arc(L * 0.48, 0, 0.06, 0, Math.PI * 2);
-            ctx.fill();
-        }
+        // Draw centered on the player (anchor at sprite center)
+        const x = -W * 0.5;
+        const y = -L * 0.5;
+        ctx.drawImage(jetSprite, x, y, W, L);
 
         ctx.restore();
     }
+
 
     function drawSpeedBar(ctx) {
         // pull from global player
@@ -528,21 +517,5 @@
         drawInfoPanel(ctx);
         drawCenterReticle(ctx);
         drawTurnDemandBar(ctx);
-    }
-
-    function roundedRect(ctx, x, y, w, h, r) {
-        ctx.beginPath();
-        ctx.moveTo(x + r, y);
-        ctx.arcTo(x + w, y, x + w, y + h, r);
-        ctx.arcTo(x + w, y + h, x, y + h, r);
-        ctx.arcTo(x, y + h, x, y, r);
-        ctx.arcTo(x, y, x + w, y, r);
-        ctx.closePath();
-    }
-
-    function wrapAngle(a) {
-        a = (a + Math.PI) % (Math.PI * 2);
-        if (a < 0) a += Math.PI * 2;
-        return a - Math.PI;
     }
 })();

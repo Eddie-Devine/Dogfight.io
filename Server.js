@@ -42,7 +42,7 @@ app.use(helmet()); //Adds security headers for HTTP
 app.use(cors()); //Blocks API requests from unauthorized domains
 app.use(express.json()); //Parses JSON request bodies
 app.use(morgan('dev')); //Logs HTTP requests to console
-app.use(favicon(path.join(__dirname, 'public', 'Images', 'Favicon.ico'))); //Serves favicon
+app.use(favicon(path.join(__dirname, 'public', 'Assets', 'Favicon.ico'))); //Serves favicon
 app.use(cookieParser()); //Parses cookies from HTTP requests
 
 // Game files requiure a session
@@ -81,7 +81,7 @@ app.post('/session/start', (req, res) => {
 		return res.status(400).json({ ok: false, error: 'Invalid name or jet.' });
 	}
 
-	const payload = { name: name.trim(), jet, role: 'player' };
+	const payload = { name: name.trim(), jet};
 	const token = jwt.sign(payload, JWT_SECRET, { expiresIn: '2h' });
 
 	// HttpOnly cookie so JS can’t tamper; secure: true because you’re on HTTPS

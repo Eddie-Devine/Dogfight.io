@@ -36,6 +36,24 @@
     resize();
 
     // ============================================================
+    // Load player jet from server
+    // ============================================================
+    let playerJet = null; // accessible within this module; also mirrored on window
+    async function loadPlayerJet() {
+        try {
+            const res = await fetch('/api/jet', { credentials: 'include' });
+            if (!res.ok) throw new Error(`Failed to load jet (${res.status})`);
+            const jet = await res.json();
+            playerJet = jet;
+            window.playerJet = jet; // expose for debugging/other modules
+            // console.log('Loaded player jet:', jet);
+        } catch (err) {
+            console.error('Error loading player jet:', err);
+        }
+    }
+    loadPlayerJet();
+
+    // ============================================================
     // World model (authoritative, screen-size independent)
     // ============================================================
     const player = {

@@ -4,7 +4,9 @@
             "Name": "F-22 Raptor",
             "Full Name": "Lockheed Martin F-22 Raptor",
             "Nation": "USA",
-            "ID": "F22"
+            "ID": "F22",
+            "gLimit": 5.0,
+            "straightR": 2000
         },
         {
             "Name": "F-16 Viper",

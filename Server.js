@@ -10,6 +10,12 @@ const fs = require('fs'); //File system module
 const favicon = require('serve-favicon'); //Favicon middleware
 const cookieParser = require('cookie-parser'); //Parses cookies
 const jwt = require('jsonwebtoken'); //handles JWT verification and signing
+const jetsCatalog = require(path.join(__dirname, 'public', 'API', 'jets.json')); // Jet catalog
+
+// Precompute jet collections from catalog
+const JETS_ARRAY = Array.isArray(jetsCatalog?.Jets) ? jetsCatalog.Jets : [];
+const JET_WHITELIST = new Set(JETS_ARRAY.map(j => j && j.ID).filter(Boolean));
+const JETS_BY_ID = new Map(JETS_ARRAY.map(j => [j.ID, j]));
 
 const app = express(); //Create Express app
 
@@ -70,11 +76,8 @@ app.get('/', (req, res) => {
 app.post('/session/start', (req, res) => {
 	const { name, jet } = req.body || {};
 
-	console.log(req.body);
-
 	// Server-side validation (don’t trust the client)
 	const validName = typeof name === 'string' && name.trim().length >= 2 && name.trim().length <= 16;
-	const JET_WHITELIST = new Set(['F22', 'F15']); // your IDs
 	const validJet = typeof jet === 'string' && JET_WHITELIST.has(jet);
 
 	if (!validName || !validJet) {
@@ -94,6 +97,21 @@ app.post('/session/start', (req, res) => {
 	});
 
 	return res.json({ ok: true });
+});
+
+//give the user their jet data based on jet id in JWT
+app.get('/api/jet', requireSession, (req, res) => {
+	try {
+		const jetId = req.player?.jet; // ID stored in JWT payload
+		if (!jetId) return res.status(400).json({ error: 'Missing jet identifier in session' });
+
+		const jet = JETS_BY_ID.get(jetId);
+		if (!jet) return res.status(404).json({ error: 'Jet not found' });
+
+		return res.json(jet);
+	} catch (err) {
+		return res.status(500).json({ error: 'Failed to resolve jet' });
+	}
 });
 
 // HTTP server for Express

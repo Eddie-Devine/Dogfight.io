@@ -135,20 +135,16 @@ function setupJetSelection() {
     }
 }
 
-// --------- Build grid from API then enable interactions ----------
-async function fetchJetData() {
-    try {
-        const response = await fetch('/API/jets.json', {
-            headers: { 'Accept': 'application/json' },
-            cache: 'no-cache',
-        });
-        if (!response.ok) throw new Error(`HTTP ${response.status} - ${response.statusText}`);
-        const data = await response.json();
-        addJets(data); // builds DOM
-        setupJetSelection(); // wire events after DOM exists
-    } catch (err) {
-        console.error('Error fetching JSON:', err);
-    }
+// --------- Build grid from local data then enable interactions ----------
+function initJetGrid() {
+	const jetData = (typeof JETS_DATA !== 'undefined') ? JETS_DATA : null;
+	if (!jetData) {
+		console.error('Jet data missing. Ensure jets-data.js is loaded before main.js.');
+		return;
+	}
+
+	addJets(jetData); // builds DOM
+	setupJetSelection(); // wire events after DOM exists
 }
 
 function addJets(jetData) {
@@ -183,4 +179,4 @@ function addJets(jetData) {
     gridEl.appendChild(frag);
 }
 
-document.addEventListener('DOMContentLoaded', fetchJetData);
+document.addEventListener('DOMContentLoaded', initJetGrid);

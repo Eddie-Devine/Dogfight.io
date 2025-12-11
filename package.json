@@ -5,7 +5,9 @@
   "main": "Server.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node server.js"
+    "start": "node scripts/manage-stack.js start",
+    "stop": "node scripts/manage-stack.js stop",
+    "restart": "sudo npm stop && sudo npm start"
   },
   "repository": {
     "type": "git",

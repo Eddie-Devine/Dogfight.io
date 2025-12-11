@@ -4,6 +4,7 @@
     // ============================================================
     const world = document.getElementById('world');
     const hud = document.getElementById('hud');
+    const helpPanels = Array.from(document.querySelectorAll('.help'));
     const wctx = world.getContext('2d');
     const hctx = hud.getContext('2d');
 
@@ -17,6 +18,9 @@
     jetSprite.src = '/Assets/placeholder_player.png';
     let jetReady = false;
     jetSprite.onload = () => { jetReady = true; };
+    const JET_LENGTH = 4.0 * 10;
+    const JET_WIDTH = 3.2 * 10;
+    const remotePlayers = new Map();
 
     function resize() {
         cw = world.clientWidth;
@@ -38,7 +42,13 @@
     // ============================================================
     // Load player jet from server
     // ============================================================
+    const WS_PATH = window.__DF_WS_PATH || '/ws/';
+    const STATE_UPDATE_INTERVAL = 100;
+
     let playerJet = null; // accessible within this module; also mirrored on window
+    let gameSocket = null;
+    let stateTimer = null;
+    let reconnectTimer = null;
     async function loadPlayerJet() {
         try {
             const res = await fetch('/api/jet', { credentials: 'include' });
@@ -46,6 +56,10 @@
             const jet = await res.json();
             playerJet = jet;
             window.playerJet = jet; // expose for debugging/other modules
+            const mechanicSource = jet?.Mechanics ?? jet?.mechanics;
+            if (!mechanicSource) throw new Error('Loaded jet is missing mechanics data');
+            const resolvedMechanics = applyPlayerMechanics(mechanicSource);
+            jet._resolvedMechanics = resolvedMechanics;
             // console.log('Loaded player jet:', jet);
         } catch (err) {
             console.error('Error loading player jet:', err);
@@ -56,21 +70,36 @@
     // ============================================================
     // World model (authoritative, screen-size independent)
     // ============================================================
+    let activeMechanics = null;
+    window.activeMechanics = activeMechanics;
+
     const player = {
         id: 'local',
         pos: { x: 0, y: 0 },     // world units
         heading: 0,              // radians (0° = North, clockwise positive)
-        speed: 14,               // world units / second
-        targetSpeed: 14,
-        minSpeed: 6,
-        maxSpeed: 300,
-        accel: 30,
-        minRadius: 50,
-        maxRadius: 170,
+        speed: 0,
+        targetSpeed: 0,
+        minSpeed: 0,
+        maxSpeed: 0,
+        accel: 0,
+        minRadius: 0,
+        maxRadius: 0,
+        maxGForce: 0,
+        gForceScalar: 1, // prevents divide-by-zero before mechanics load
+        mechanics: activeMechanics,
+        mechanicsReady: false,
+        health: 0,
+        maxHealth: 0,
+        fuel: 0,
+        maxFuel: 0,
+        fuelRate: 1000,
+        radarDistance: 0,
+        radarContacts: [],
         turnDemand: 0,           // [-1..+1]
         turnDecay: 2.5,          // (unused without pointer lock, OK to keep)
         rollSway: 0,
     };
+    window.player = player;
 
     const camera = { x: 0, y: 0, stiffness: 6.0 };
 
@@ -78,8 +107,23 @@
     // Input: W/S speed, mouse X => turnDemand
     // ============================================================
     const keys = new Set();
+    function setHelpVisible(visible) {
+        helpPanels.forEach((el) => {
+            el.style.opacity = visible ? '' : '0';
+            el.style.visibility = visible ? '' : 'hidden';
+        });
+    }
+    let helpVisible = true;
+    setHelpVisible(helpVisible);
+
     window.addEventListener('keydown', (e) => {
         if (e.repeat) return;
+        if (e.code === 'KeyH') {
+            helpVisible = !helpVisible;
+            setHelpVisible(helpVisible);
+            e.preventDefault();
+            return;
+        }
         if (e.code === 'KeyW' || e.code === 'KeyS') e.preventDefault();
         keys.add(e.code);
     });
@@ -126,6 +170,263 @@
         ctx.closePath();
     }
 
+    function getInterpolatedPos(entry, now = performance.now()) {
+        const { prevPos, nextPos, prevTime, nextTime } = entry;
+        if (!prevPos && !nextPos) return { x: 0, y: 0 };
+        if (!prevPos) return { ...nextPos };
+        if (!nextPos) return { ...prevPos };
+        const span = Math.max(1, nextTime - prevTime);
+        const t = clamp((now - prevTime) / span, 0, 1.2);
+        return {
+            x: lerp(prevPos.x, nextPos.x, t),
+            y: lerp(prevPos.y, nextPos.y, t),
+        };
+    }
+
+    function getInterpolatedHeading(entry, now = performance.now()) {
+        const { prevHeading, nextHeading, prevTime, nextTime } = entry;
+        if (prevHeading === undefined && nextHeading === undefined) return 0;
+        if (prevHeading === undefined) return nextHeading || 0;
+        if (nextHeading === undefined) return prevHeading || 0;
+        const span = Math.max(1, nextTime - prevTime);
+        const t = clamp((now - prevTime) / span, 0, 1.2);
+        let delta = nextHeading - prevHeading;
+        delta = Math.atan2(Math.sin(delta), Math.cos(delta));
+        return prevHeading + delta * t;
+    }
+
+    function lerpColor(a, b, t) {
+        return [
+            Math.round(lerp(a[0], b[0], t)),
+            Math.round(lerp(a[1], b[1], t)),
+            Math.round(lerp(a[2], b[2], t)),
+        ];
+    }
+
+    function updateRemotePlayers(contacts) {
+        if (!Array.isArray(contacts)) return;
+        const now = performance.now();
+        const seen = new Set();
+
+        for (const contact of contacts) {
+            if (!contact?.id || !contact.pos) continue;
+            seen.add(contact.id);
+            const target = { x: contact.pos.x, y: contact.pos.y };
+            const entry = remotePlayers.get(contact.id);
+
+            if (entry) {
+                const current = getInterpolatedPos(entry, now);
+                const headingCurrent = getInterpolatedHeading(entry, now);
+                entry.prevPos = current;
+                entry.prevHeading = headingCurrent;
+                entry.prevTime = now;
+                entry.nextPos = target;
+                entry.nextHeading = contact.heading ?? headingCurrent;
+                entry.nextTime = now + STATE_UPDATE_INTERVAL;
+                entry.lastSeen = now;
+            } else {
+                const heading = contact.heading || 0;
+                remotePlayers.set(contact.id, {
+                    prevPos: target,
+                    nextPos: target,
+                    prevHeading: heading,
+                    nextHeading: heading,
+                    prevTime: now,
+                    nextTime: now + STATE_UPDATE_INTERVAL,
+                    lastSeen: now,
+                });
+            }
+        }
+
+        for (const [id, entry] of remotePlayers) {
+            if (seen.has(id)) continue;
+            if (now - entry.lastSeen > 1500) {
+                remotePlayers.delete(id);
+            }
+        }
+    }
+
+    function getRemotePlayerSnapshots() {
+        const snapshots = [];
+        const now = performance.now();
+        for (const [id, entry] of remotePlayers) {
+            if (now - entry.lastSeen > 2000) {
+                remotePlayers.delete(id);
+                continue;
+            }
+            snapshots.push({
+                id,
+                pos: getInterpolatedPos(entry, now),
+                heading: getInterpolatedHeading(entry, now),
+            });
+        }
+        return snapshots;
+    }
+
+    function requireNumber(label, value) {
+        const n = Number(value);
+        if (!Number.isFinite(n)) {
+            throw new Error(`Jet mechanics missing valid '${label}' value`);
+        }
+        return n;
+    }
+
+    function resolveMechanics(source = null) {
+        if (!source || typeof source !== 'object') {
+            throw new Error('Jet is missing mechanics data');
+        }
+
+        const pick = (keys, label) => {
+            for (const key of keys) {
+                if (source[key] !== undefined) {
+                    return requireNumber(label, source[key]);
+                }
+            }
+            throw new Error(`Jet mechanics missing '${label}'`);
+        };
+
+        return {
+            cruiseSpeed: pick(['cruiseSpeed', 'CruiseSpeed', 'cruise', 'Cruise', 'speed', 'Speed'], 'cruiseSpeed'),
+            minSpeed: pick(['minSpeed', 'MinSpeed', 'minimumSpeed', 'min'], 'minSpeed'),
+            maxSpeed: pick(['maxSpeed', 'MaxSpeed', 'maximumSpeed', 'max'], 'maxSpeed'),
+            accel: pick(['accel', 'Accel', 'acceleration', 'Acceleration', 'accell'], 'accel'),
+            minRadius: pick(['minRadius', 'MinRadius', 'turnMinRadius', 'tightRadius'], 'minRadius'),
+            maxRadius: pick(['maxRadius', 'MaxRadius', 'turnMaxRadius', 'wideRadius'], 'maxRadius'),
+            maxGForce: pick(['maxGForce', 'MaxGForce', 'gLimit', 'GLimit'], 'maxGForce'),
+            gForceScalar: pick(['gForceScalar', 'GForceScalar', 'gScalar', 'turnScaler'], 'gForceScalar'),
+            maxHealth: pick(['maxHealth', 'MaxHealth', 'health', 'Health'], 'maxHealth'),
+            maxFuel: pick(['maxFuel', 'MaxFuel', 'fuelCapacity', 'FuelCapacity'], 'maxFuel'),
+            fuelRate: pick(['fuelRate', 'FuelRate', 'fuelBurnMs', 'FuelBurnMs'], 'fuelRate'),
+            radarDistance: pick(['radarDistance', 'RadarDistance', 'radar', 'Radar'], 'radarDistance'),
+        };
+    }
+
+    function applyPlayerMechanics(source) {
+        const resolved = resolveMechanics(source);
+        activeMechanics = resolved;
+        window.activeMechanics = resolved;
+        player.mechanics = resolved;
+
+        const cruise = clamp(resolved.cruiseSpeed, resolved.minSpeed, resolved.maxSpeed);
+        player.minSpeed = resolved.minSpeed;
+        player.maxSpeed = resolved.maxSpeed;
+        player.accel = resolved.accel;
+        player.minRadius = resolved.minRadius;
+        player.maxRadius = resolved.maxRadius;
+        player.maxGForce = resolved.maxGForce;
+        player.gForceScalar = resolved.gForceScalar;
+        player.maxHealth = resolved.maxHealth;
+        player.health = resolved.maxHealth;
+        player.maxFuel = resolved.maxFuel;
+        player.fuel = resolved.maxFuel;
+        player.fuelRate = resolved.fuelRate;
+        player.radarDistance = resolved.radarDistance;
+        player.speed = cruise;
+        player.targetSpeed = cruise;
+        player.mechanicsReady = true;
+        return resolved;
+    }
+
+    function buildSocketUrl() {
+        const basePath = WS_PATH.startsWith('/') ? WS_PATH : `/${WS_PATH}`;
+        const protocol = 'wss:';
+        return `${protocol}//${window.location.host}${basePath}`;
+    }
+
+    function pushPlayerState() {
+        if (!gameSocket || gameSocket.readyState !== WebSocket.OPEN) return;
+        if (!player.mechanicsReady) return;
+        const payload = {
+            type: 'state:update',
+            pos: { x: player.pos.x, y: player.pos.y },
+            health: player.health,
+            speed: player.speed,
+            heading: player.heading,
+        };
+        try {
+            gameSocket.send(JSON.stringify(payload));
+        } catch (err) {
+            console.warn('Failed to send player state update', err);
+        }
+    }
+
+    function startStateSync() {
+        if (stateTimer) window.clearInterval(stateTimer);
+        stateTimer = window.setInterval(pushPlayerState, STATE_UPDATE_INTERVAL);
+    }
+
+    function stopStateSync() {
+        if (stateTimer) {
+            window.clearInterval(stateTimer);
+            stateTimer = null;
+        }
+    }
+
+    function scheduleReconnect() {
+        if (reconnectTimer) return;
+        reconnectTimer = window.setTimeout(() => {
+            reconnectTimer = null;
+            connectGameSocket();
+        }, 1500);
+    }
+
+    function connectGameSocket() {
+        stopStateSync();
+        if (gameSocket && gameSocket.readyState === WebSocket.OPEN) {
+            try { gameSocket.close(4000, 'Restarting socket'); } catch { /* noop */ }
+        }
+
+        remotePlayers.clear();
+        player.radarContacts = [];
+
+        const url = buildSocketUrl();
+        gameSocket = new WebSocket(url);
+        window.gameSocket = gameSocket;
+
+        gameSocket.addEventListener('open', () => {
+            pushPlayerState();
+            startStateSync();
+        });
+
+        gameSocket.addEventListener('message', (event) => {
+            let data;
+            try {
+                data = JSON.parse(event.data);
+            } catch {
+                return;
+            }
+            if (data?.type === 'session:init') {
+                console.info('Connected to session', data.player);
+                if (typeof data.player?.fuel === 'number') player.fuel = data.player.fuel;
+                if (typeof data.player?.maxFuel === 'number') player.maxFuel = data.player.maxFuel;
+                if (Array.isArray(data.player?.radar)) {
+                    player.radarContacts = data.player.radar;
+                    updateRemotePlayers(data.player.radar);
+                }
+            } else if (data?.type === 'state:sync') {
+                if (typeof data.fuel === 'number') player.fuel = data.fuel;
+                if (typeof data.health === 'number') player.health = data.health;
+                if (Array.isArray(data.radar)) {
+                    player.radarContacts = data.radar;
+                    updateRemotePlayers(data.radar);
+                }
+            }
+        });
+
+        gameSocket.addEventListener('close', () => {
+            stopStateSync();
+            scheduleReconnect();
+        });
+
+        gameSocket.addEventListener('error', () => {
+            if (gameSocket.readyState === WebSocket.OPEN) {
+                gameSocket.close();
+            }
+        });
+    }
+
+    connectGameSocket();
+
     // HUD turn knob smoothing (UI-only)
     let uiTurn = 0;      // what we draw
     let uiTarget = 0;    // desired knob position
@@ -162,6 +463,8 @@
     requestAnimationFrame(loop);
 
     function step(dt) {
+        if (!player.mechanicsReady) return;
+
         // smooth speed to target
         const ds = player.targetSpeed - player.speed;
         player.speed += clamp(ds, -player.accel * dt, player.accel * dt);
@@ -177,8 +480,15 @@
         const ad = Math.abs(demand);
         const turnDir = Math.sign(demand) || 0;
 
-        // radius & turn rate
-        const radius = (ad === 0) ? Infinity : lerp(player.maxRadius, player.minRadius, ad);
+        // radius & turn rate (with g-force limit)
+        let radius = (ad === 0) ? Infinity : lerp(player.maxRadius, player.minRadius, ad);
+
+        if (ad !== 0) {
+            const maxCentripetal = Math.max(1, player.maxGForce * player.gForceScalar);
+            const gLimitedRadius = (player.speed * player.speed) / maxCentripetal;
+            radius = Math.max(radius, gLimitedRadius);
+        }
+
         const omega = (turnDir === 0) ? 0 : (player.speed / radius) * turnDir; // rad/s
 
 
@@ -219,8 +529,9 @@
         wctx.scale(PPU, PPU);
         wctx.translate(-camera.x, -camera.y);
 
-        drawGrid(wctx);
-        drawPlayer(wctx, player);
+            drawGrid(wctx);
+            drawOtherJets(wctx);
+            drawPlayer(wctx, player);
 
         wctx.restore();
 
@@ -266,10 +577,6 @@
     }
 
     function drawPlayer(ctx, p) {
-        // Size in WORLD units (not pixels). Tweak as you like.
-        const L = 4.0 * 10;   // length
-        const W = 3.2 * 10;   // width
-
         if (!jetReady) return; // don't draw until the image is loaded
 
         ctx.save();
@@ -286,11 +593,26 @@
         ctx.imageSmoothingEnabled = true;
 
         // Draw centered on the player (anchor at sprite center)
-        const x = -W * 0.5;
-        const y = -L * 0.5;
-        ctx.drawImage(jetSprite, x, y, W, L);
+        const x = -JET_WIDTH * 0.5;
+        const y = -JET_LENGTH * 0.5;
+        ctx.drawImage(jetSprite, x, y, JET_WIDTH, JET_LENGTH);
 
         ctx.restore();
+    }
+
+    function drawOtherJets(ctx) {
+        if (!jetReady) return;
+        const contacts = getRemotePlayerSnapshots();
+        for (const contact of contacts) {
+            if (!contact?.pos) continue;
+            ctx.save();
+            ctx.translate(contact.pos.x, contact.pos.y);
+            ctx.rotate(contact.heading || 0);
+            const x = -JET_WIDTH * 0.5;
+            const y = -JET_LENGTH * 0.5;
+            ctx.drawImage(jetSprite, x, y, JET_WIDTH, JET_LENGTH);
+            ctx.restore();
+        }
     }
 
 
@@ -386,12 +708,14 @@
         const pad = 14;
         const boxW = 230;
         const lineH = 18;
+        const infoLines = 6;
+        const boxH = 24 + infoLines * lineH;
 
         ctx.save();
         ctx.translate(pad, pad);
 
         // panel box
-        roundedRect(ctx, 0, 0, boxW, 96, 10);
+        roundedRect(ctx, 0, 0, boxW, boxH, 10);
         ctx.fillStyle = 'rgba(0,0,0,0.35)';
         ctx.strokeStyle = 'rgba(255,255,255,0.10)';
         ctx.fill();
@@ -404,6 +728,8 @@
 
         // compute values (keep HUD consistent with physics)
         const speed = player.speed;
+        const posX = player.pos.x;
+        const posY = player.pos.y;
         const hdgDeg = ((player.heading * 180 / Math.PI) % 360 + 360) % 360;
 
         const tDisplay = Math.max(-1, Math.min(1, uiTurn));
@@ -423,10 +749,83 @@
         // lines
         let y = 10;
         ctx.fillText(`SPD: ${speed.toFixed(1)} u/s`, 12, y); y += lineH;
+        ctx.fillText(`POS X: ${posX.toFixed(1)} u`, 12, y); y += lineH;
+        ctx.fillText(`POS Y: ${posY.toFixed(1)} u`, 12, y); y += lineH;
         ctx.fillText(`HDG: ${hdgDeg.toFixed(0)}°`, 12, y); y += lineH;
         ctx.fillText(`TURN R: ${Number.isFinite(radiusHUD) ? radiusHUD.toFixed(1) + ' u' : '∞'}`, 12, y); y += lineH;
         ctx.fillText(`Ω: ${(omegaHUD * 180 / Math.PI).toFixed(2)} °/s`, 12, y);
 
+        ctx.restore();
+    }
+
+    function drawResourceBar(ctx, opts) {
+        const { label, value, maxValue, panelX, panelY, width, colorFrom, colorTo } = opts;
+        if (!player.mechanicsReady || maxValue <= 0) return;
+
+        const panelW = width;
+        const panelH = 48;
+        const barHeight = 14;
+
+        const trackX = panelX + 12;
+        const trackY = panelY + 22;
+        const trackW = panelW - 24;
+
+        const clampedValue = clamp(value, 0, maxValue);
+        const ratio = clamp(clampedValue / Math.max(1, maxValue), 0, 1);
+        const [r, g, b] = lerpColor(colorFrom, colorTo, ratio);
+
+        roundedRect(ctx, panelX, panelY, panelW, panelH, 10);
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(255,255,255,0.06)';
+        ctx.strokeStyle = 'rgba(160,200,230,0.35)';
+        ctx.lineWidth = 1;
+        roundedRect(ctx, trackX, trackY, trackW, barHeight, 7);
+        ctx.fill();
+        ctx.stroke();
+
+        if (ratio > 0) {
+            ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.85)`;
+            roundedRect(ctx, trackX, trackY, trackW * ratio, barHeight, 7);
+            ctx.fill();
+        }
+
+        ctx.fillStyle = '#a9c5de';
+        ctx.font = '12px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(`${label} ${Math.round(clampedValue)}/${Math.round(maxValue)}`, panelX + panelW / 2, panelY + 12);
+    }
+
+    function drawHealthBar(ctx) {
+        ctx.save();
+        const pad = 14;
+        const panelW = 230;
+        const panelX = cw - pad - panelW;
+        const panelY = pad;
+        drawResourceBar(ctx, {
+            label: 'HEALTH',
+            value: player.health,
+            maxValue: player.maxHealth,
+            panelX,
+            panelY,
+            width: panelW,
+            colorFrom: [220, 90, 70],
+            colorTo: [105, 222, 150],
+        });
+        drawResourceBar(ctx, {
+            label: 'FUEL',
+            value: player.fuel,
+            maxValue: player.maxFuel,
+            panelX: panelX - (panelW + 12),
+            panelY,
+            width: panelW,
+            colorFrom: [240, 150, 60],
+            colorTo: [120, 210, 255],
+        });
         ctx.restore();
     }
 
@@ -442,6 +841,152 @@
         ctx.moveTo(16, 0); ctx.lineTo(6, 0);
         ctx.moveTo(0, -16); ctx.lineTo(0, -6);
         ctx.moveTo(0, 16); ctx.lineTo(0, 6);
+        ctx.stroke();
+
+        ctx.restore();
+    }
+
+    function drawRadar(ctx) {
+        const size = 200;
+        const margin = 14;
+        const panelX = cw - margin - size;
+        const panelY = ch - margin - size;
+        const centerX = panelX + size / 2;
+        const centerY = panelY + size / 2;
+        const radius = (size / 2) - 14;
+
+        ctx.save();
+
+        roundedRect(ctx, panelX, panelY, size, size, 14);
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.translate(centerX, centerY);
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
+        ctx.lineWidth = 1.5;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius * 0.66, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.2)';
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius * 0.33, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.15)';
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.3)';
+        ctx.beginPath();
+        ctx.moveTo(-radius, 0);
+        ctx.lineTo(radius, 0);
+        ctx.moveTo(0, -radius);
+        ctx.lineTo(0, radius);
+        ctx.stroke();
+
+        const contacts = getRemotePlayerSnapshots();
+        const maxRange = player.radarDistance || 0;
+        if (maxRange > 0) {
+            ctx.fillStyle = 'rgba(125, 255, 180, 0.35)';
+            for (const contact of contacts) {
+                if (!contact?.pos) continue;
+                const dx = contact.pos.x - player.pos.x;
+                const dy = contact.pos.y - player.pos.y;
+                const dist = Math.sqrt(dx * dx + dy * dy);
+                if (dist > maxRange) continue;
+                const t = dist / maxRange;
+                const angle = Math.atan2(dx, -dy);
+                const r = radius * t;
+                const px = Math.sin(angle) * r;
+                const py = -Math.cos(angle) * r;
+                ctx.beginPath();
+                ctx.arc(px, py, 4, 0, Math.PI * 2);
+                ctx.fill();
+            }
+        }
+
+        const sweepSpeed = 0.7;
+        const sweepAngle = (performance.now() / 1000) * sweepSpeed;
+        const gradient = ctx.createRadialGradient(0, 0, 0, 0, 0, radius);
+        gradient.addColorStop(0, 'rgba(80,255,170,0.2)');
+        gradient.addColorStop(1, 'rgba(80,255,170,0)');
+        ctx.fillStyle = gradient;
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.arc(0, 0, radius, sweepAngle, sweepAngle + Math.PI / 3);
+        ctx.closePath();
+        ctx.fill();
+
+        ctx.restore();
+    }
+
+    function drawRWR(ctx) {
+        const radarSize = 200;
+        const margin = 14;
+        const spacing = 10;
+        const size = 120;
+        const panelX = cw - margin - radarSize + (radarSize - size) * 0.5;
+        const panelY = ch - margin - radarSize - spacing - size;
+        const centerX = panelX + size / 2;
+        const centerY = panelY + size / 2;
+        const radius = (size / 2) - 10;
+
+        ctx.save();
+
+        roundedRect(ctx, panelX - 4, panelY - 36, size + 8, 28, 6);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.5)';
+        ctx.lineWidth = 1;
+        ctx.stroke();
+        ctx.font = '14px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        ctx.fillStyle = 'rgba(125, 255, 180, 0.85)';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('RWR', panelX + (size / 2), panelY - 22);
+
+        roundedRect(ctx, panelX, panelY, size, size, 14);
+        ctx.fillStyle = 'rgba(0,0,0,0.35)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.translate(centerX, centerY);
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
+        ctx.lineWidth = 1.2;
+        ctx.stroke();
+
+        ctx.beginPath();
+        ctx.arc(0, 0, radius * 0.45, 0, Math.PI * 2);
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.25)';
+        ctx.stroke();
+
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
+        ctx.lineWidth = 1;
+        for (let i = 0; i < 8; i++) {
+            const angle = (Math.PI * 2 * i) / 8;
+            const x = Math.cos(angle) * radius;
+            const y = Math.sin(angle) * radius;
+            const inner = radius - 10;
+            ctx.beginPath();
+            ctx.moveTo(Math.cos(angle) * inner, Math.sin(angle) * inner);
+            ctx.lineTo(x, y);
+            ctx.stroke();
+        }
+
+        ctx.strokeStyle = 'rgba(125, 255, 180, 0.5)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.moveTo(0, -radius * 0.5);
+        ctx.lineTo(radius * 0.25, radius * 0.4);
+        ctx.lineTo(-radius * 0.25, radius * 0.4);
+        ctx.closePath();
         ctx.stroke();
 
         ctx.restore();
@@ -530,6 +1075,10 @@
     function drawHUD(ctx) {
         // draw left speed bar first so other panels can overlap if needed
         drawSpeedBar(ctx);
+
+        drawHealthBar(ctx);
+        drawRadar(ctx);
+        drawRWR(ctx);
 
         // core HUD elements
         drawInfoPanel(ctx);

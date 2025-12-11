@@ -1,0 +1,40 @@
+(function initJetsCatalog(root, factory) {
+	const data = factory();
+	if (typeof module === 'object' && module.exports) {
+		module.exports = data;
+	} else if (root) {
+		root.JETS_DATA = data;
+	}
+})(typeof globalThis !== 'undefined' ? globalThis : this, function buildJetsCatalog() {
+	return {
+		Jets: [
+			{
+				ID: 'F22',
+				Name: 'F-22 Raptor',
+				Manufacturer: 'Lockheed Martin',
+				Nationality: 'USA',
+				Year: '2005',
+				Mechanics: {
+					cruiseSpeed: 0,
+					minSpeed: 0,
+					maxSpeed: 380,
+					accel: 55,
+					minRadius: 45,
+					maxRadius: 200,
+					maxGForce: 9,
+					gForceScalar: 12,
+					maxHealth: 150,
+					radarDistance: 1000*3,
+					maxFuel: 150,
+					fuelRate: 1000,
+				},
+				Sounds: {
+
+				},
+				Images: {
+
+				}
+			},
+		],
+	};
+});

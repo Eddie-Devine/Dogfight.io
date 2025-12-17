@@ -27,6 +27,25 @@ function clampCoord(value) {
 	return Math.max(-COORD_LIMIT, Math.min(COORD_LIMIT, value));
 }
 
+function getThreatIds(targetId) {
+	const ids = [];
+	const target = players.get(targetId);
+	if (!target) return ids;
+	const maxDistSq = (Number(target.rwrDistance) || 0) ** 2;
+	for (const observer of players.values()) {
+		if (observer.id === targetId) continue;
+		if (!observer.visibleTargets || !observer.visibleTargets.has(targetId)) continue;
+		if (maxDistSq > 0) {
+			const dx = observer.pos.x - target.pos.x;
+			const dy = observer.pos.y - target.pos.y;
+			const distSq = dx * dx + dy * dy;
+			if (distSq > maxDistSq) continue;
+		}
+		ids.push(observer.id);
+	}
+	return ids;
+}
+
 function sanitizePlayerState(playerState) {
 	return {
 		id: playerState.id,
@@ -57,7 +76,7 @@ function applyFuelBurn(state, reportedSpeed = 0) {
 	}
 }
 
-function collectRadarContacts(observer) {
+function collectRadarContacts(observer, snapshots = false) {
 	const now = Date.now();
 	if ((observer.nextRadarPush || 0) > now) return observer.lastRadarContacts || [];
 	observer.nextRadarPush = now + RADAR_PUSH_INTERVAL;
@@ -69,6 +88,7 @@ function collectRadarContacts(observer) {
 	}
 
 	const rangeSq = range * range;
+	const visibleIds = new Set();
 	const contacts = [];
 
 	for (const [id, target] of players) {
@@ -83,10 +103,12 @@ function collectRadarContacts(observer) {
 				pos: { x: target.pos.x, y: target.pos.y },
 				heading: target.heading || 0,
 			});
+			visibleIds.add(id);
 		}
 	}
 
 	observer.lastRadarContacts = contacts;
+	observer.visibleTargets = visibleIds;
 	return contacts;
 }
 
@@ -100,12 +122,18 @@ function createWebSocketServer(options = {}) {
 	const syncTimer = setInterval(() => {
 		for (const state of players.values()) {
 			if (!state?.ws || state.ws.readyState !== state.ws.OPEN) continue;
+			const radarContacts = collectRadarContacts(state);
+
+			const threatIds = getThreatIds(state.id);
+			const trackedBy = threatIds.length > 0;
+
 			try {
 				state.ws.send(JSON.stringify({
 					type: 'state:sync',
 					fuel: state.fuel,
 					health: state.health,
-					radar: collectRadarContacts(state),
+					radar: radarContacts,
+					rwr: { search: trackedBy, targets: threatIds },
 				}));
 			} catch {
 				// ignore
@@ -138,12 +166,18 @@ function createWebSocketServer(options = {}) {
 		}
 
 			const playerId = `${payload.name || 'anon'}:${payload.jet}`;
-			const mechanics = jet?.Mechanics || jet?.mechanics || {};
-			const maxHealth = Number(mechanics?.maxHealth) || 100;
-		const maxFuel = Number(mechanics?.maxFuel) || 100;
-		const fuelRate = Number(mechanics?.fuelRate) || 1000;
-		const maxSpeed = Number(mechanics?.maxSpeed) || 1;
-		const radarDistance = Number(mechanics?.radarDistance) || 0;
+			const mechanics = jet?.Mechanics || {};
+			const num = (val, fallback = 0) => {
+				const n = Number(val);
+				return Number.isFinite(n) ? n : fallback;
+			};
+
+	const maxHealth = num(mechanics.maxHealth, 100);
+	const maxFuel = num(mechanics.maxFuel, 100);
+	const fuelRate = num(mechanics.fuelRate, 1000);
+	const maxSpeed = num(mechanics.maxSpeed, 1);
+	const radarDistance = num(mechanics.radarDistance, 0);
+	const rwrDistance = num(mechanics.RWRDistance ?? mechanics.rwrDistance, radarDistance);
 
 			if (players.has(playerId)) {
 				const existing = players.get(playerId);
@@ -161,12 +195,13 @@ function createWebSocketServer(options = {}) {
 			maxHealth,
 			fuel: maxFuel,
 			maxFuel,
-			fuelRate,
-			maxSpeed,
-			radarDistance,
-			heading: 0,
-			ws,
-			lastUpdate: Date.now(),
+		fuelRate,
+		maxSpeed,
+		radarDistance,
+		rwrDistance,
+		heading: 0,
+		ws,
+		lastUpdate: Date.now(),
 			lastFuelTick: Date.now(),
 			nextRadarPush: Date.now(),
 		};
@@ -200,11 +235,17 @@ function createWebSocketServer(options = {}) {
 					state.lastUpdate = Date.now();
 
 					try {
+						const radarContacts = collectRadarContacts(state);
+
+						const threatIds = getThreatIds(state.id);
+						const trackedBy = threatIds.length > 0;
+
 						ws.send(JSON.stringify({
 							type: 'state:sync',
 							fuel: state.fuel,
 							health: state.health,
-							radar: collectRadarContacts(state),
+							radar: radarContacts,
+							rwr: { search: trackedBy, targets: threatIds },
 						}));
 					} catch {
 						// ignore send failure

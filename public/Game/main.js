@@ -21,6 +21,24 @@
     const JET_LENGTH = 4.0 * 10;
     const JET_WIDTH = 3.2 * 10;
     const remotePlayers = new Map();
+    const rwrContactSound = new Audio('/Assets/RWR_Contact.wav');
+    const radarContactSound = new Audio('/Assets/Rader_Contact.wav');
+    rwrContactSound.preload = 'auto';
+    radarContactSound.preload = 'auto';
+
+    function playRwrContactSound(times = 1) {
+        for (let i = 0; i < times; i++) {
+            const clip = rwrContactSound.cloneNode();
+            clip.play().catch(() => {});
+        }
+    }
+
+    function playRadarContactSound(times = 1) {
+        for (let i = 0; i < times; i++) {
+            const clip = radarContactSound.cloneNode();
+            clip.play().catch(() => {});
+        }
+    }
 
     function resize() {
         cw = world.clientWidth;
@@ -95,11 +113,15 @@
         fuelRate: 1000,
         radarDistance: 0,
         radarContacts: [],
+        rwrMode: null,           // 'SEARCH' | 'LOCK' | 'LAUNCH' | null
+        rwrDirections: [],
         turnDemand: 0,           // [-1..+1]
         turnDecay: 2.5,          // (unused without pointer lock, OK to keep)
         rollSway: 0,
     };
     window.player = player;
+    const previousRwrTargetIds = new Set();
+    const previousRadarContactIds = new Set();
 
     const camera = { x: 0, y: 0, stiffness: 6.0 };
 
@@ -395,22 +417,74 @@
             } catch {
                 return;
             }
-            if (data?.type === 'session:init') {
-                console.info('Connected to session', data.player);
-                if (typeof data.player?.fuel === 'number') player.fuel = data.player.fuel;
-                if (typeof data.player?.maxFuel === 'number') player.maxFuel = data.player.maxFuel;
-                if (Array.isArray(data.player?.radar)) {
-                    player.radarContacts = data.player.radar;
-                    updateRemotePlayers(data.player.radar);
+        if (data?.type === 'session:init') {
+            console.info('Connected to session', data.player);
+            if (typeof data.player?.fuel === 'number') player.fuel = data.player.fuel;
+            if (typeof data.player?.maxFuel === 'number') player.maxFuel = data.player.maxFuel;
+            if (Array.isArray(data.player?.radar)) {
+                player.radarContacts = data.player.radar;
+                updateRemotePlayers(data.player.radar);
+                const visibleRadarIds = new Set();
+                for (const contact of data.player.radar) {
+                    if (contact?.id) visibleRadarIds.add(contact.id);
                 }
-            } else if (data?.type === 'state:sync') {
-                if (typeof data.fuel === 'number') player.fuel = data.fuel;
-                if (typeof data.health === 'number') player.health = data.health;
-                if (Array.isArray(data.radar)) {
-                    player.radarContacts = data.radar;
-                    updateRemotePlayers(data.radar);
+                let newRadarCount = 0;
+                for (const id of visibleRadarIds) {
+                    if (!previousRadarContactIds.has(id)) newRadarCount++;
                 }
+                if (newRadarCount > 0) {
+                    playRadarContactSound(newRadarCount);
+                }
+                previousRadarContactIds.clear();
+                for (const id of visibleRadarIds) previousRadarContactIds.add(id);
             }
+        } else if (data?.type === 'state:sync') {
+            if (typeof data.fuel === 'number') player.fuel = data.fuel;
+            if (typeof data.health === 'number') player.health = data.health;
+            if (Array.isArray(data.radar)) {
+                player.radarContacts = data.radar;
+                updateRemotePlayers(data.radar);
+                const visibleRadarIds = new Set();
+                for (const contact of data.radar) {
+                    if (contact?.id) visibleRadarIds.add(contact.id);
+                }
+                let newRadarCount = 0;
+                for (const id of visibleRadarIds) {
+                    if (!previousRadarContactIds.has(id)) newRadarCount++;
+                }
+                if (newRadarCount > 0) {
+                    playRadarContactSound(newRadarCount);
+                }
+                previousRadarContactIds.clear();
+                for (const id of visibleRadarIds) previousRadarContactIds.add(id);
+            }
+            if (data.rwr && typeof data.rwr.search === 'boolean') {
+                player.rwrMode = data.rwr.search ? 'SEARCH' : null;
+                const targets = Array.isArray(data.rwr.targets) ? new Set(data.rwr.targets) : new Set();
+                const dirs = [];
+                const visibleTargets = new Set();
+                if (targets.size > 0 && Array.isArray(player.radarContacts)) {
+                    for (const contact of player.radarContacts) {
+                        if (!contact?.id || !contact.pos) continue;
+                        if (!targets.has(contact.id)) continue;
+                        const dx = contact.pos.x - player.pos.x;
+                        const dy = contact.pos.y - player.pos.y;
+                        dirs.push(Math.atan2(dx, -dy));
+                        visibleTargets.add(contact.id);
+                    }
+                }
+                const newContacts = [];
+                for (const id of visibleTargets) {
+                    if (!previousRwrTargetIds.has(id)) newContacts.push(id);
+                }
+                if (newContacts.length > 0) {
+                    playRwrContactSound(newContacts.length);
+                }
+                previousRwrTargetIds.clear();
+                for (const id of visibleTargets) previousRwrTargetIds.add(id);
+                player.rwrDirections = dirs;
+            }
+        }
         });
 
         gameSocket.addEventListener('close', () => {
@@ -938,6 +1012,10 @@
 
         ctx.save();
 
+        const modeLabel = (player.rwrMode && ['SEARCH','LOCK','LAUNCH'].includes(player.rwrMode.toUpperCase()))
+            ? player.rwrMode.toUpperCase()
+            : 'RWR';
+
         roundedRect(ctx, panelX - 4, panelY - 36, size + 8, 28, 6);
         ctx.strokeStyle = 'rgba(125, 255, 180, 0.5)';
         ctx.lineWidth = 1;
@@ -946,7 +1024,7 @@
         ctx.fillStyle = 'rgba(125, 255, 180, 0.85)';
         ctx.textAlign = 'center';
         ctx.textBaseline = 'middle';
-        ctx.fillText('RWR', panelX + (size / 2), panelY - 22);
+        ctx.fillText(modeLabel, panelX + (size / 2), panelY - 22);
 
         roundedRect(ctx, panelX, panelY, size, size, 14);
         ctx.fillStyle = 'rgba(0,0,0,0.35)';
@@ -969,8 +1047,8 @@
 
         ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
         ctx.lineWidth = 1;
-        for (let i = 0; i < 8; i++) {
-            const angle = (Math.PI * 2 * i) / 8;
+        for (let i = 0; i < 12; i++) {
+            const angle = (Math.PI * 2 * i) / 12;
             const x = Math.cos(angle) * radius;
             const y = Math.sin(angle) * radius;
             const inner = radius - 10;
@@ -980,12 +1058,50 @@
             ctx.stroke();
         }
 
+        const threatAngles = Array.isArray(player.rwrDirections) ? player.rwrDirections : [];
+        if (threatAngles.length > 0) {
+            const wedge = Math.PI / 3; // 60° wedge to span two 30° ticks
+            const tick = Math.PI / 6;  // 30° tick marks
+            const twoPi = Math.PI * 2;
+            ctx.fillStyle = 'rgba(80,255,170,0.25)';
+            const innerR = radius * 0.7; // tighter to the outer band
+            for (const worldAngle of threatAngles) {
+                const normalized = ((worldAngle % twoPi) + twoPi) % twoPi;
+                // canvas 0 rad points right; our angles use 0 = up
+                const displayAngle = normalized - Math.PI / 2;
+                const snapped = Math.round(displayAngle / tick) * tick;
+                const start = snapped - wedge * 0.5;
+                const end = snapped + wedge * 0.5;
+                ctx.beginPath();
+                ctx.arc(0, 0, radius, start, end);
+                ctx.arc(0, 0, innerR, end, start, true);
+                ctx.closePath();
+                ctx.fill();
+            }
+        }
+
+        // stylized jet outline in center
         ctx.strokeStyle = 'rgba(125, 255, 180, 0.5)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        ctx.moveTo(0, -radius * 0.5);
-        ctx.lineTo(radius * 0.25, radius * 0.4);
-        ctx.lineTo(-radius * 0.25, radius * 0.4);
+        const nose = { x: 0, y: -radius * 0.42 };
+        const spineMid = { x: radius * 0.08, y: -radius * 0.18 };
+        const wingTip = { x: radius * 0.34, y: -radius * 0.02 };
+        const wingRoot = { x: wingTip.x, y: radius * 0.10 };
+        const wingInner = { x: radius * 0.12, y: radius * 0.12 };
+        const tailWing = { x: radius * 0.18, y: radius * 0.20 };
+
+        ctx.moveTo(nose.x, nose.y);
+        ctx.lineTo(spineMid.x, spineMid.y);
+        ctx.lineTo(wingTip.x, wingTip.y);
+        ctx.lineTo(wingRoot.x, wingRoot.y);
+        ctx.lineTo(wingInner.x, wingInner.y);
+        ctx.lineTo(tailWing.x, tailWing.y);
+        ctx.lineTo(-tailWing.x, tailWing.y);
+        ctx.lineTo(-wingInner.x, wingInner.y);
+        ctx.lineTo(-wingRoot.x, wingRoot.y);
+        ctx.lineTo(-wingTip.x, wingTip.y);
+        ctx.lineTo(-spineMid.x, spineMid.y);
         ctx.closePath();
         ctx.stroke();
 

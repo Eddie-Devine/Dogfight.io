@@ -24,15 +24,10 @@
 					maxGForce: 9,
 					gForceScalar: 12,
 					maxHealth: 150,
-					radarDistance: 1000*3,
+					radarDistance: 3000,
+					RWRDistance: 1500,
 					maxFuel: 150,
 					fuelRate: 1000,
-				},
-				Sounds: {
-
-				},
-				Images: {
-
 				}
 			},
 		],

@@ -46,14 +46,23 @@ function buildApp() {
 	app.use(favicon(path.join(PUBLIC_DIR, 'Assets', 'Favicon.ico')));
 	app.use(cookieParser());
 
-	app.use('/Game', requireSession, express.static(path.join(PUBLIC_DIR, 'Game'), { maxAge: '1d' }));
+	// Disable client-side caching during development
+	app.use((req, res, next) => {
+		res.set('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+		res.set('Pragma', 'no-cache');
+		res.set('Expires', '0');
+		res.set('Surrogate-Control', 'no-store');
+		next();
+	});
+
+	app.use('/Game', requireSession, express.static(path.join(PUBLIC_DIR, 'Game'), { maxAge: 0, etag: false }));
 
 	app.get('/game', requireSession, (req, res) => {
 		res.sendFile(path.join(PUBLIC_DIR, 'Game', 'index.html'));
 	});
 
-	app.use('/MainMenu', express.static(path.join(PUBLIC_DIR, 'MainMenu'), { maxAge: '1d' }));
-	app.use(express.static(PUBLIC_DIR, { maxAge: '1d' }));
+	app.use('/MainMenu', express.static(path.join(PUBLIC_DIR, 'MainMenu'), { maxAge: 0, etag: false }));
+	app.use(express.static(PUBLIC_DIR, { maxAge: 0, etag: false }));
 
 	app.get('/', (req, res) => {
 		res.sendFile(path.join(PUBLIC_DIR, 'MainMenu', 'index.html'));

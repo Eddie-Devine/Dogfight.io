@@ -14,7 +14,18 @@
     <canvas id="hud"></canvas>
   </div>
 
-  <div class="hint help">Move mouse left/right to turn. Press <b>W/S</b> for speed. Press <b>H</b> to toggle hints.</div>
+  <div class="chat-hud" aria-label="Chat">
+    <div class="chat-panel">
+      <div class="chat-messages">
+        <!-- <div class="chat-line"><span class="chat-tag">[Guide]</span><span class="chat-text">Welcome Ignis Maximus</span></div> -->
+      </div>
+      <div class="chat-input">
+        <input type="text" placeholder="To chat click here or press ENTER key" aria-label="Chat message" maxlength="280" />
+      </div>
+    </div>
+  </div>
+
+  <div class="hint help">Move mouse left/right to turn. Press <b>W/S</b> for speed. Press <b>H</b> to hide hints.</div>
   <div class="help">
     <span class="badge">W</span>faster
     <span class="badge">S</span>slower

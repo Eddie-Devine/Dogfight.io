@@ -5,8 +5,30 @@
     const world = document.getElementById('world');
     const hud = document.getElementById('hud');
     const helpPanels = Array.from(document.querySelectorAll('.help'));
+    const chatHud = document.querySelector('.chat-hud');
+    const chatInput = document.querySelector('.chat-input input');
+    const chatMessages = document.querySelector('.chat-messages');
+    const CHAT_MAX_LINES = 100;
+    const CHAT_MAX_LENGTH = 280;
+    const DEFAULT_CHAT_COLOR = '#7DF5C3';
+    if (chatInput) chatInput.maxLength = CHAT_MAX_LENGTH;
+    let chatColor = DEFAULT_CHAT_COLOR;
     const wctx = world.getContext('2d');
     const hctx = hud.getContext('2d');
+
+    function readCookie(name) {
+        const cookies = document.cookie ? document.cookie.split(';') : [];
+        for (const c of cookies) {
+            const [k, ...rest] = c.trim().split('=');
+            if (k === name) return decodeURIComponent(rest.join('='));
+        }
+        return null;
+    }
+
+    function writeCookie(name, value, days = 30) {
+        const expires = new Date(Date.now() + days * 24 * 60 * 60 * 1000).toUTCString();
+        document.cookie = `${name}=${encodeURIComponent(value)}; expires=${expires}; path=/`;
+    }
 
     let dpr = 1, cw = 0, ch = 0;        // CSS pixels
     let vw = 0, vh = 0;                 // device pixels
@@ -23,8 +45,16 @@
     const remotePlayers = new Map();
     const rwrContactSound = new Audio('/Assets/RWR_Contact.wav');
     const radarContactSound = new Audio('/Assets/Rader_Contact.wav');
+    const cannonSound = new Audio('/Assets/brrt.wav');
     rwrContactSound.preload = 'auto';
     radarContactSound.preload = 'auto';
+    cannonSound.preload = 'auto';
+    cannonSound.loop = true;
+    const CANNON_AUDIBLE_RANGE = 700;
+    const ENEMY_CANNON_SOUND_COOLDOWN = 350; // ms
+    const ENEMY_CANNON_STOP_DELAY = 100; // ms after last shot to stop loop
+    let lastEnemyCannonSoundAt = 0;
+    const enemyCannonLoops = new Map(); // shooterId -> { audio, stopTimer }
 
     function playRwrContactSound(times = 1) {
         for (let i = 0; i < times; i++) {
@@ -93,6 +123,7 @@
 
     const player = {
         id: 'local',
+        serverId: null,
         pos: { x: 0, y: 0 },     // world units
         heading: 0,              // radians (0° = North, clockwise positive)
         speed: 0,
@@ -113,7 +144,7 @@
         fuelRate: 1000,
         radarDistance: 0,
         radarContacts: [],
-        rwrMode: null,           // 'SEARCH' | 'LOCK' | 'LAUNCH' | null
+        rwrMode: null,           // 'DETECTED' | 'LOCK' | 'LAUNCH' | null
         rwrDirections: [],
         turnDemand: 0,           // [-1..+1]
         turnDecay: 2.5,          // (unused without pointer lock, OK to keep)
@@ -123,6 +154,155 @@
     const previousRwrTargetIds = new Set();
     const previousRadarContactIds = new Set();
 
+    const weapons = [
+        { id: 'cannon', label: 'Cannon' },
+        { id: 'missiles', label: 'Missiles' },
+    ];
+    const DEFAULT_CANNON_RATE = 10;
+    const DEFAULT_CANNON_COOLDOWN = 1500;
+    const DEFAULT_CANNON_BURST = 2000;
+    const DEFAULT_CANNON_AMMO = 500;
+    let selectedWeaponIndex = 0;
+    const projectiles = [];
+    const CANNON_MUZZLE_SPEED = 600;
+    const CANNON_LIFETIME = 2.5; // seconds
+    const CANNON_DAMAGE = 15;
+    const cannonState = {
+        ammo: DEFAULT_CANNON_AMMO,
+        rate: DEFAULT_CANNON_RATE,
+        cooldownMs: DEFAULT_CANNON_COOLDOWN,
+        burstMs: DEFAULT_CANNON_BURST,
+        cooldownUntil: 0,
+        burstUsedMs: 0,
+        lastFireWall: 0,
+    };
+    let cannonNextFireAt = 0;
+    let isCannonTriggerHeld = false;
+    let cannonFiredThisHold = false;
+    let cannonSoundPlaying = false;
+    window.getSelectedWeapon = () => weapons[selectedWeaponIndex] || null;
+
+    function selectWeaponByIndex(idx) {
+        if (weapons.length === 0) return;
+        const normalized = ((idx % weapons.length) + weapons.length) % weapons.length;
+        selectedWeaponIndex = normalized;
+    }
+
+    function cycleWeapon(delta) {
+        if (!Number.isFinite(delta) || delta === 0) return;
+        selectWeaponByIndex(selectedWeaponIndex + Math.sign(delta));
+    }
+
+    function playCannonLoop() {
+        if (cannonSoundPlaying) return;
+        cannonSound.currentTime = 0;
+        cannonSound.play().then(() => {
+            cannonSoundPlaying = true;
+        }).catch(() => {});
+    }
+
+    function stopCannonLoop() {
+        if (!cannonSoundPlaying) return;
+        cannonSound.pause();
+        cannonSound.currentTime = 0;
+        cannonSoundPlaying = false;
+    }
+
+    function stopEnemyCannonLoop(shooterId) {
+        const entry = enemyCannonLoops.get(shooterId);
+        if (!entry) return;
+        if (entry.stopTimer) {
+            window.clearTimeout(entry.stopTimer);
+            entry.stopTimer = null;
+        }
+        try {
+            entry.audio.pause();
+            entry.audio.currentTime = 0;
+        } catch {
+            // ignore
+        }
+        enemyCannonLoops.delete(shooterId);
+    }
+
+    function playEnemyCannonLoop(shooterId, pos = null) {
+        const now = Date.now();
+        if (now - lastEnemyCannonSoundAt < ENEMY_CANNON_SOUND_COOLDOWN) {
+            // still update timer to extend loop
+            const existing = enemyCannonLoops.get(shooterId);
+            if (existing) {
+                if (existing.stopTimer) window.clearTimeout(existing.stopTimer);
+                existing.stopTimer = window.setTimeout(() => stopEnemyCannonLoop(shooterId), ENEMY_CANNON_STOP_DELAY);
+            }
+            return;
+        }
+
+        if (pos) {
+            const dx = pos.x - player.pos.x;
+            const dy = pos.y - player.pos.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            if (dist > CANNON_AUDIBLE_RANGE) {
+                stopEnemyCannonLoop(shooterId);
+                return;
+            }
+        }
+
+        let entry = enemyCannonLoops.get(shooterId);
+        if (!entry) {
+            const loop = new Audio('/Assets/brrt.wav');
+            loop.preload = 'auto';
+            loop.loop = true;
+            entry = { audio: loop, stopTimer: null };
+            enemyCannonLoops.set(shooterId, entry);
+        }
+
+        if (pos) {
+            const dx = pos.x - player.pos.x;
+            const dy = pos.y - player.pos.y;
+            const dist = Math.sqrt(dx * dx + dy * dy);
+            const falloff = clamp(1 - dist / CANNON_AUDIBLE_RANGE, 0, 1);
+            entry.audio.volume = Math.max(0.1, falloff * 0.8);
+        } else {
+            entry.audio.volume = 0.6;
+        }
+
+        if (entry.audio.paused) {
+            entry.audio.currentTime = 0;
+            entry.audio.play().catch(() => {});
+        }
+
+        if (entry.stopTimer) window.clearTimeout(entry.stopTimer);
+        entry.stopTimer = window.setTimeout(() => stopEnemyCannonLoop(shooterId), ENEMY_CANNON_STOP_DELAY);
+        lastEnemyCannonSoundAt = now;
+    }
+
+    function getCannonCooldownRemaining() {
+        if (!cannonState.cooldownUntil) return 0;
+        return Math.max(0, cannonState.cooldownUntil - Date.now());
+    }
+
+    function startCannonCooldown() {
+        if (!Number.isFinite(cannonState.cooldownMs) || cannonState.cooldownMs <= 0) return;
+        const nowWall = Date.now();
+        const target = nowWall + cannonState.cooldownMs;
+        if (cannonState.cooldownUntil && cannonState.cooldownUntil > target) return;
+        cannonState.cooldownUntil = target;
+        cannonState.burstUsedMs = 0;
+        cannonNextFireAt = performance.now() + cannonState.cooldownMs / 1000;
+        stopCannonLoop();
+    }
+
+    function syncCannonFromServer(cannon) {
+        if (!cannon || typeof cannon !== 'object') return;
+        if (typeof cannon.ammo === 'number') cannonState.ammo = Math.max(0, cannon.ammo);
+        if (typeof cannon.rate === 'number' && Number.isFinite(cannon.rate)) cannonState.rate = Math.max(1, cannon.rate);
+        if (typeof cannon.cooldownMs === 'number' && cannon.cooldownMs >= 0) cannonState.cooldownMs = cannon.cooldownMs;
+        if (typeof cannon.burstMs === 'number' && cannon.burstMs >= 0) cannonState.burstMs = cannon.burstMs;
+        if (typeof cannon.cooldownRemaining === 'number' && cannon.cooldownRemaining > 0) {
+            cannonState.cooldownUntil = Date.now() + cannon.cooldownRemaining;
+            cannonNextFireAt = performance.now() + cannon.cooldownRemaining / 1000;
+        }
+    }
+
     const camera = { x: 0, y: 0, stiffness: 6.0 };
 
     // ============================================================
@@ -131,25 +311,101 @@
     const keys = new Set();
     function setHelpVisible(visible) {
         helpPanels.forEach((el) => {
-            el.style.opacity = visible ? '' : '0';
-            el.style.visibility = visible ? '' : 'hidden';
+            el.classList.toggle('help-hidden', !visible);
         });
+        writeCookie('df_help_visible', visible ? '1' : '0');
     }
-    let helpVisible = true;
+    const helpCookie = readCookie('df_help_visible');
+    let helpVisible = !(helpCookie === '0' || helpCookie === 'false');
     setHelpVisible(helpVisible);
 
     window.addEventListener('keydown', (e) => {
         if (e.repeat) return;
+
+        const chatFocused = chatInput && document.activeElement === chatInput;
+
+        if (e.code === 'Enter' && chatInput) {
+            if (chatFocused) {
+                if (chatInput.value.trim().length === 0) {
+                    chatInput.blur();
+                } else {
+                    sendChatMessage();
+                }
+            } else {
+                chatInput.focus();
+                chatInput.select();
+            }
+            e.preventDefault();
+            return;
+        }
+
+        if (chatFocused && e.code === 'Escape') {
+            chatInput.blur();
+            e.preventDefault();
+            return;
+        }
+
         if (e.code === 'KeyH') {
+            if (chatFocused) return; // allow typing "h" in chat without toggling help
             helpVisible = !helpVisible;
             setHelpVisible(helpVisible);
+            e.preventDefault();
+            return;
+        }
+        if (chatFocused) return;
+
+        if (e.code === 'Digit1' || e.code === 'Numpad1') {
+            selectWeaponByIndex(0);
+            e.preventDefault();
+            return;
+        }
+        if (e.code === 'Digit2' || e.code === 'Numpad2') {
+            selectWeaponByIndex(1);
             e.preventDefault();
             return;
         }
         if (e.code === 'KeyW' || e.code === 'KeyS') e.preventDefault();
         keys.add(e.code);
     });
-    window.addEventListener('keyup', (e) => { keys.delete(e.code); });
+    window.addEventListener('keyup', (e) => {
+        const chatFocused = chatInput && document.activeElement === chatInput;
+        if (chatFocused) return;
+        keys.delete(e.code);
+    });
+
+    window.addEventListener('mousedown', (e) => {
+        const chatFocused = chatInput && document.activeElement === chatInput;
+        if (chatFocused) return;
+        if (e.button === 0) {
+            const weapon = weapons[selectedWeaponIndex];
+            if (weapon?.id === 'cannon') {
+                isCannonTriggerHeld = true;
+                tryFireCannon();
+            }
+        }
+    });
+
+    window.addEventListener('wheel', (e) => {
+        const chatFocused = chatInput && document.activeElement === chatInput;
+        if (chatFocused) return;
+        if (!weapons.length) return;
+        const direction = Math.sign(e.deltaY);
+        if (direction !== 0) {
+            cycleWeapon(direction);
+            e.preventDefault();
+        }
+    }, { passive: false });
+
+    window.addEventListener('mouseup', (e) => {
+        if (e.button === 0) {
+            isCannonTriggerHeld = false;
+            if (cannonFiredThisHold) {
+                startCannonCooldown();
+                cannonFiredThisHold = false;
+            }
+            stopCannonLoop();
+        }
+    });
 
     let mouse = { x: cw / 2, y: ch / 2 };
     window.addEventListener('mousemove', (e) => {
@@ -175,6 +431,78 @@
     function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 
     function lerp(a, b, t) { return a + (b - a) * t; }
+
+    function setChatAccentColor(color = DEFAULT_CHAT_COLOR) {
+        let hex = typeof color === 'string' ? color.trim() : DEFAULT_CHAT_COLOR;
+        const match = /^#?([0-9a-fA-F]{6})$/.exec(hex);
+        if (!match) hex = DEFAULT_CHAT_COLOR;
+        if (!hex.startsWith('#')) hex = `#${hex}`;
+        const r = parseInt(hex.slice(1, 3), 16);
+        const g = parseInt(hex.slice(3, 5), 16);
+        const b = parseInt(hex.slice(5, 7), 16);
+        chatColor = hex;
+        const target = chatHud || document.documentElement;
+        target.style.setProperty('--chat-accent', hex);
+        target.style.setProperty('--chat-accent-rgb', `${r}, ${g}, ${b}`);
+    }
+
+    function appendChatMessage(entry) {
+        if (!chatMessages || !entry) return;
+        const name = (entry.from && (entry.from.name || entry.from.id)) || 'System';
+        const text = typeof entry.text === 'string' ? entry.text : '';
+        const line = document.createElement('div');
+        line.className = 'chat-line';
+        const tag = document.createElement('span');
+        tag.className = 'chat-tag';
+        tag.textContent = `[${name}]`;
+        if (entry.from?.color) {
+            tag.style.color = entry.from.color;
+        }
+        const body = document.createElement('span');
+        body.className = 'chat-text';
+        body.textContent = text;
+        line.appendChild(tag);
+        line.appendChild(body);
+        chatMessages.appendChild(line);
+        while (chatMessages.children.length > CHAT_MAX_LINES) {
+            chatMessages.removeChild(chatMessages.firstChild);
+        }
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+    }
+
+    function sendChatMessage() {
+        if (!chatInput) return;
+        let text = chatInput.value.trim();
+        if (text.length === 0) return;
+        if (text.length > CHAT_MAX_LENGTH) {
+            text = text.slice(0, CHAT_MAX_LENGTH);
+        }
+        const payload = { type: 'chat:send', text };
+        if (!gameSocket || gameSocket.readyState !== WebSocket.OPEN) {
+            appendChatMessage({ from: { name: 'System' }, text: 'Cannot send chat: disconnected.' });
+            chatInput.blur();
+            return;
+        }
+        try {
+            gameSocket.send(JSON.stringify(payload));
+            chatInput.value = '';
+            chatInput.blur();
+        } catch (err) {
+            console.warn('Failed to send chat', err);
+            chatInput.blur();
+        }
+    }
+
+    // Bias accel higher at low speed, lower at high speed.
+    function getScaledAccel() {
+        if (!player.mechanicsReady) return 0;
+        const denom = Math.max(1e-6, player.maxSpeed - player.minSpeed);
+        const t = clamp((player.speed - player.minSpeed) / denom, 0, 1);
+        const curve = Math.pow(t, 0.85);
+        const lowScale = 5 //1.35
+        const highScale = 1; //0.55
+        return player.accel * lerp(lowScale, highScale, curve);
+    }
 
     function wrapAngle(a) {
         a = (a + Math.PI) % (Math.PI * 2);
@@ -246,6 +574,8 @@
                 entry.nextHeading = contact.heading ?? headingCurrent;
                 entry.nextTime = now + STATE_UPDATE_INTERVAL;
                 entry.lastSeen = now;
+                if (typeof contact.health === 'number') entry.health = contact.health;
+                if (typeof contact.maxHealth === 'number') entry.maxHealth = contact.maxHealth;
             } else {
                 const heading = contact.heading || 0;
                 remotePlayers.set(contact.id, {
@@ -256,6 +586,8 @@
                     prevTime: now,
                     nextTime: now + STATE_UPDATE_INTERVAL,
                     lastSeen: now,
+                    health: typeof contact.health === 'number' ? contact.health : undefined,
+                    maxHealth: typeof contact.maxHealth === 'number' ? contact.maxHealth : undefined,
                 });
             }
         }
@@ -280,9 +612,132 @@
                 id,
                 pos: getInterpolatedPos(entry, now),
                 heading: getInterpolatedHeading(entry, now),
+                health: entry.health,
+                maxHealth: entry.maxHealth,
             });
         }
         return snapshots;
+    }
+
+    function tryFireCannon() {
+        if (!player.mechanicsReady || player.health <= 0) return;
+        const weapon = weapons[selectedWeaponIndex];
+        if (!weapon || weapon.id !== 'cannon') return;
+        const now = performance.now();
+        const wallNow = Date.now();
+        const rateMs = 1000 / Math.max(1, cannonState.rate);
+
+        if (cannonNextFireAt > 0 && now < cannonNextFireAt) return;
+        if (cannonState.cooldownUntil && wallNow < cannonState.cooldownUntil) {
+            stopCannonLoop();
+            return;
+        }
+        if (cannonState.lastFireWall && (wallNow - cannonState.lastFireWall) > cannonState.cooldownMs) {
+            cannonState.burstUsedMs = 0;
+        }
+
+        if (cannonState.ammo <= 0) {
+            stopCannonLoop();
+            return;
+        }
+
+        const burstLimit = Math.max(0, cannonState.burstMs);
+        const projectedBurst = cannonState.burstUsedMs + rateMs;
+        if (burstLimit > 0 && projectedBurst > burstLimit) {
+            startCannonCooldown();
+            return;
+        }
+
+        cannonNextFireAt = now + rateMs;
+        cannonState.lastFireWall = wallNow;
+        cannonState.burstUsedMs = projectedBurst;
+        cannonState.ammo = Math.max(0, cannonState.ammo - 1);
+        cannonFiredThisHold = true;
+
+        const heading = player.heading;
+        const dirX = Math.sin(heading);
+        const dirY = -Math.cos(heading);
+        const muzzleOffset = JET_LENGTH * 0.6;
+        const spawnX = player.pos.x + dirX * muzzleOffset;
+        const spawnY = player.pos.y + dirY * muzzleOffset;
+        const speed = Math.max(0, CANNON_MUZZLE_SPEED + player.speed);
+
+        projectiles.push({
+            type: 'cannon',
+            pos: { x: spawnX, y: spawnY },
+            vel: { x: dirX * speed, y: dirY * speed },
+            ttl: CANNON_LIFETIME,
+            ownerId: player.serverId || player.id || 'local',
+        });
+
+        playCannonLoop();
+
+        if (burstLimit > 0 && cannonState.burstUsedMs >= burstLimit) {
+            startCannonCooldown();
+        }
+
+        if (gameSocket && gameSocket.readyState === WebSocket.OPEN) {
+            try {
+                gameSocket.send(JSON.stringify({ type: 'combat:fire', weapon: 'cannon' }));
+            } catch {
+                // ignore
+            }
+        }
+    }
+
+    function reportCannonHit(targetId, pos) {
+        if (!gameSocket || gameSocket.readyState !== WebSocket.OPEN) return;
+        const payload = {
+            type: 'combat:damage',
+            targetId,
+            amount: CANNON_DAMAGE,
+            weapon: 'cannon',
+            pos,
+        };
+        try {
+            gameSocket.send(JSON.stringify(payload));
+        } catch (err) {
+            console.warn('Failed to report cannon hit', err);
+        }
+    }
+
+    function updateProjectiles(dt) {
+        if (projectiles.length === 0) return;
+        const targets = getRemotePlayerSnapshots();
+        const hitRadius = JET_WIDTH * 0.55;
+        const hitRadiusSq = hitRadius * hitRadius;
+
+        for (let i = projectiles.length - 1; i >= 0; i--) {
+            const p = projectiles[i];
+            p.ttl -= dt;
+            if (p.ttl <= 0) {
+                projectiles.splice(i, 1);
+                continue;
+            }
+
+            p.pos.x += p.vel.x * dt;
+            p.pos.y += p.vel.y * dt;
+
+            const ownedByLocal = !p.ownerId || p.ownerId === player.serverId || p.ownerId === player.id;
+            if (ownedByLocal) {
+                let hit = false;
+                for (const target of targets) {
+                    if (!target?.id || !target.pos) continue;
+                    const dx = target.pos.x - p.pos.x;
+                    const dy = target.pos.y - p.pos.y;
+                    const distSq = dx * dx + dy * dy;
+                    if (distSq <= hitRadiusSq) {
+                        reportCannonHit(target.id, { x: p.pos.x, y: p.pos.y });
+                        hit = true;
+                        break;
+                    }
+                }
+
+                if (hit) {
+                    projectiles.splice(i, 1);
+                }
+            }
+        }
     }
 
     function requireNumber(label, value) {
@@ -320,6 +775,10 @@
             maxFuel: pick(['maxFuel', 'MaxFuel', 'fuelCapacity', 'FuelCapacity'], 'maxFuel'),
             fuelRate: pick(['fuelRate', 'FuelRate', 'fuelBurnMs', 'FuelBurnMs'], 'fuelRate'),
             radarDistance: pick(['radarDistance', 'RadarDistance', 'radar', 'Radar'], 'radarDistance'),
+            cannonRate: Number.isFinite(source.cannonRate) ? source.cannonRate : DEFAULT_CANNON_RATE,
+            cannonCooldown: Number.isFinite(source.cannonCooldown) ? source.cannonCooldown : DEFAULT_CANNON_COOLDOWN,
+            cannonBurst: Number.isFinite(source.cannonBurst) ? source.cannonBurst : DEFAULT_CANNON_BURST,
+            cannonAmmo: Number.isFinite(source.cannonAmmo) ? source.cannonAmmo : DEFAULT_CANNON_AMMO,
         };
     }
 
@@ -346,6 +805,10 @@
         player.speed = cruise;
         player.targetSpeed = cruise;
         player.mechanicsReady = true;
+        cannonState.rate = Math.max(1, resolved.cannonRate || DEFAULT_CANNON_RATE);
+        cannonState.cooldownMs = Math.max(0, resolved.cannonCooldown || DEFAULT_CANNON_COOLDOWN);
+        cannonState.burstMs = Math.max(0, resolved.cannonBurst || DEFAULT_CANNON_BURST);
+        cannonState.ammo = Math.max(0, resolved.cannonAmmo || DEFAULT_CANNON_AMMO);
         return resolved;
     }
 
@@ -361,7 +824,6 @@
         const payload = {
             type: 'state:update',
             pos: { x: player.pos.x, y: player.pos.y },
-            health: player.health,
             speed: player.speed,
             heading: player.heading,
         };
@@ -419,8 +881,16 @@
             }
         if (data?.type === 'session:init') {
             console.info('Connected to session', data.player);
+            if (typeof data.chatColor === 'string') setChatAccentColor(data.chatColor);
+            if (typeof data.player?.id === 'string') {
+                player.id = data.player.id;
+                player.serverId = data.player.id;
+            }
+            if (typeof data.player?.health === 'number') player.health = data.player.health;
+            if (typeof data.player?.maxHealth === 'number') player.maxHealth = data.player.maxHealth;
             if (typeof data.player?.fuel === 'number') player.fuel = data.player.fuel;
             if (typeof data.player?.maxFuel === 'number') player.maxFuel = data.player.maxFuel;
+            if (data.player?.cannon) syncCannonFromServer(data.player.cannon);
             if (Array.isArray(data.player?.radar)) {
                 player.radarContacts = data.player.radar;
                 updateRemotePlayers(data.player.radar);
@@ -441,6 +911,7 @@
         } else if (data?.type === 'state:sync') {
             if (typeof data.fuel === 'number') player.fuel = data.fuel;
             if (typeof data.health === 'number') player.health = data.health;
+            if (data.cannon) syncCannonFromServer(data.cannon);
             if (Array.isArray(data.radar)) {
                 player.radarContacts = data.radar;
                 updateRemotePlayers(data.radar);
@@ -458,8 +929,12 @@
                 previousRadarContactIds.clear();
                 for (const id of visibleRadarIds) previousRadarContactIds.add(id);
             }
-            if (data.rwr && typeof data.rwr.search === 'boolean') {
-                player.rwrMode = data.rwr.search ? 'SEARCH' : null;
+            const hasRwrFlag = data.rwr && (typeof data.rwr.detected === 'boolean' || typeof data.rwr.search === 'boolean');
+            if (hasRwrFlag) {
+                const detected = (typeof data.rwr.detected === 'boolean')
+                    ? data.rwr.detected
+                    : Boolean(data.rwr.search);
+                player.rwrMode = detected ? 'DETECTED' : null;
                 const targets = Array.isArray(data.rwr.targets) ? new Set(data.rwr.targets) : new Set();
                 const dirs = [];
                 const visibleTargets = new Set();
@@ -484,6 +959,51 @@
                 for (const id of visibleTargets) previousRwrTargetIds.add(id);
                 player.rwrDirections = dirs;
             }
+        } else if (data?.type === 'combat:damage') {
+            const targetId = data.targetId;
+            const isSelf = targetId && (targetId === player.serverId || targetId === player.id);
+            if (isSelf && typeof data.remainingHealth === 'number') {
+                player.health = Math.max(0, data.remainingHealth);
+            }
+        } else if (data?.type === 'combat:death') {
+            const targetId = data.targetId;
+            const isSelf = targetId && (targetId === player.serverId || targetId === player.id);
+            if (isSelf) {
+                player.health = 0;
+            }
+        } else if (data?.type === 'combat:fire:ack') {
+            if (data.weapon === 'cannon') {
+                if (typeof data.ammo === 'number') cannonState.ammo = Math.max(0, data.ammo);
+                if (typeof data.cooldownRemaining === 'number' && data.cooldownRemaining > 0) {
+                    cannonState.cooldownUntil = Date.now() + data.cooldownRemaining;
+                }
+                if (data.allowed === false && data.reason === 'cooldown') {
+                    cannonState.burstUsedMs = 0;
+                }
+            }
+        } else if (data?.type === 'combat:projectile') {
+            if (data.weapon === 'cannon' && data.shooterId !== player.serverId && data.shooterId !== player.id) {
+                const ttl = typeof data.ttlMs === 'number' ? data.ttlMs / 1000 : CANNON_LIFETIME;
+                const pos = (data.pos && typeof data.pos.x === 'number' && typeof data.pos.y === 'number')
+                    ? { x: data.pos.x, y: data.pos.y }
+                    : { x: 0, y: 0 };
+                const vel = (data.vel && typeof data.vel.x === 'number' && typeof data.vel.y === 'number')
+                    ? { x: data.vel.x, y: data.vel.y }
+                    : { x: 0, y: 0 };
+                projectiles.push({
+                    type: 'cannon',
+                    pos,
+                    vel,
+                    ttl: Math.max(0.1, ttl),
+                    ownerId: data.shooterId,
+                });
+                playEnemyCannonLoop(data.shooterId, pos);
+            }
+        } else if (data?.type === 'chat:message') {
+            appendChatMessage(data);
+        } else if (data?.type === 'chat:history' && Array.isArray(data.messages)) {
+            if (chatMessages) chatMessages.innerHTML = '';
+            data.messages.forEach((msg) => appendChatMessage(msg));
         }
         });
 
@@ -499,6 +1019,7 @@
         });
     }
 
+    setChatAccentColor(DEFAULT_CHAT_COLOR);
     connectGameSocket();
 
     // HUD turn knob smoothing (UI-only)
@@ -519,8 +1040,9 @@
         acc = Math.min(MAX_ACC, acc + dt);
 
         // input -> target speed
-        if (keys.has('KeyW')) player.targetSpeed = Math.min(player.maxSpeed, player.targetSpeed + player.accel * dt);
-        if (keys.has('KeyS')) player.targetSpeed = Math.max(player.minSpeed, player.targetSpeed - player.accel * dt);
+        const accelRate = getScaledAccel();
+        if (keys.has('KeyW')) player.targetSpeed = Math.min(player.maxSpeed, player.targetSpeed + accelRate * dt);
+        if (keys.has('KeyS')) player.targetSpeed = Math.max(player.minSpeed, player.targetSpeed - accelRate * dt);
 
         while (acc >= FIXED_DT) {
             step(FIXED_DT);
@@ -539,9 +1061,14 @@
     function step(dt) {
         if (!player.mechanicsReady) return;
 
+        if (isCannonTriggerHeld && weapons[selectedWeaponIndex]?.id === 'cannon') {
+            tryFireCannon();
+        }
+
         // smooth speed to target
         const ds = player.targetSpeed - player.speed;
-        player.speed += clamp(ds, -player.accel * dt, player.accel * dt);
+        const accelRate = getScaledAccel();
+        player.speed += clamp(ds, -accelRate * dt, accelRate * dt);
 
         // --- turn radius mapping (physics truth with a tiny deadzone) ---
         let demand = player.turnDemand;                 // [-1..1]
@@ -585,6 +1112,8 @@
         // visual roll sway for HUD sprite
         const targetSway = clamp(-turnDir * ad, -1, 1);
         player.rollSway += (targetSway - player.rollSway) * (1 - Math.exp(-8 * dt));
+
+        updateProjectiles(dt);
     }
 
     // ============================================================
@@ -604,6 +1133,7 @@
         wctx.translate(-camera.x, -camera.y);
 
             drawGrid(wctx);
+            drawProjectiles(wctx);
             drawOtherJets(wctx);
             drawPlayer(wctx, player);
 
@@ -650,6 +1180,21 @@
         }
     }
 
+    function drawProjectiles(ctx) {
+        if (!projectiles.length) return;
+        ctx.save();
+        ctx.fillStyle = 'rgba(255, 225, 140, 0.9)';
+        ctx.strokeStyle = 'rgba(255, 160, 80, 0.9)';
+        ctx.lineWidth = 0.3;
+        for (const p of projectiles) {
+            ctx.beginPath();
+            ctx.arc(p.pos.x, p.pos.y, 1.6, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.stroke();
+        }
+        ctx.restore();
+    }
+
     function drawPlayer(ctx, p) {
         if (!jetReady) return; // don't draw until the image is loaded
 
@@ -685,6 +1230,33 @@
             const x = -JET_WIDTH * 0.5;
             const y = -JET_LENGTH * 0.5;
             ctx.drawImage(jetSprite, x, y, JET_WIDTH, JET_LENGTH);
+
+            if (typeof contact.health === 'number' && typeof contact.maxHealth === 'number' && contact.maxHealth > 0) {
+                const barW = JET_WIDTH * 0.8;
+                const barH = 3.5;
+                const barX = -barW * 0.5;
+                const barY = JET_LENGTH * 0.5 + 6;
+                const clamped = clamp(contact.health, 0, contact.maxHealth);
+                const ratio = clamp(clamped / contact.maxHealth, 0, 1);
+
+                ctx.save();
+                ctx.rotate(- (contact.heading || 0)); // keep bar world-aligned (optional)
+                ctx.fillStyle = 'rgba(0,0,0,0.35)';
+                ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+                ctx.lineWidth = 0.5;
+                roundedRect(ctx, barX, barY, barW, barH, 2);
+                ctx.fill();
+                ctx.stroke();
+
+                if (ratio > 0) {
+                    const [r, g, b] = lerpColor([220, 90, 70], [105, 222, 150], ratio);
+                    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.9)`;
+                    roundedRect(ctx, barX, barY, barW * ratio, barH, 2);
+                    ctx.fill();
+                }
+                ctx.restore();
+            }
+
             ctx.restore();
         }
     }
@@ -706,8 +1278,31 @@
         // vertically center the panel (keeps clear of your top-left info box)
         const panelX = padEdge;
         const panelY = (ch - panelH) * 0.5;
+        const keyBoxSize = panelW;
+        const keyBoxGap = 10;
+        const keyBoxX = panelX;
+        const keyBoxTopY = panelY - keyBoxGap - keyBoxSize;
+        const keyBoxBottomY = panelY + panelH + keyBoxGap;
 
         ctx.save();
+
+        const drawKeyBox = (x, y, label, active) => {
+            roundedRect(ctx, x, y, keyBoxSize, keyBoxSize, 10);
+            ctx.fillStyle = active ? 'rgba(120,200,255,0.25)' : 'rgba(0,0,0,0.35)';
+            ctx.strokeStyle = active ? 'rgba(168,230,255,0.8)' : 'rgba(255,255,255,0.12)';
+            ctx.lineWidth = 1.5;
+            ctx.fill();
+            ctx.stroke();
+
+            ctx.fillStyle = active ? 'rgba(220,245,255,0.95)' : 'rgba(169,197,222,0.85)';
+            ctx.font = '20px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(label, x + keyBoxSize / 2, y + keyBoxSize / 2);
+        };
+
+        drawKeyBox(keyBoxX, keyBoxTopY, 'W', keys.has('KeyW'));
+        drawKeyBox(keyBoxX, keyBoxBottomY, 'S', keys.has('KeyS'));
 
         // panel
         roundedRect(ctx, panelX, panelY, panelW, panelH, 10);
@@ -752,7 +1347,7 @@
         ctx.textAlign = 'left';
         ctx.textBaseline = 'middle';
 
-        const step = 20;
+        const step = 30;
         const vMin = Math.ceil(minSpeed / step) * step;
         const vMax = Math.floor(maxSpeed / step) * step;
         for (let v = vMin; v <= vMax; v += step) {
@@ -999,6 +1594,101 @@
         ctx.restore();
     }
 
+    function drawWeaponSelector(ctx) {
+        if (!weapons.length) return;
+        const radarSize = 200;
+        const margin = 14;
+        const spacing = 10;
+        const rwrSize = 120;
+        const panelW = rwrSize + 32;
+        const itemH = 40;
+        const padding = 14;
+        const headerH = 20;
+        const gap = 48;
+        const rwrY = ch - margin - radarSize - spacing - rwrSize;
+        const panelH = headerH + padding * 2 + weapons.length * itemH;
+        const panelX = cw - margin - radarSize + (radarSize - panelW) * 0.5;
+        const panelY = rwrY - gap - panelH;
+
+        ctx.save();
+
+        roundedRect(ctx, panelX, panelY, panelW, panelH, 12);
+        ctx.fillStyle = 'rgba(0,0,0,0.45)';
+        ctx.strokeStyle = 'rgba(255,255,255,0.10)';
+        ctx.lineWidth = 1;
+        ctx.fill();
+        ctx.stroke();
+
+        ctx.fillStyle = 'rgba(169,197,222,0.92)';
+        ctx.font = '13px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText('WEAPONS', panelX + panelW / 2, panelY + padding - 2);
+
+        const listStartY = panelY + padding + headerH;
+        for (let i = 0; i < weapons.length; i++) {
+            const item = weapons[i];
+            const y = listStartY + i * itemH;
+            const isSelected = i === selectedWeaponIndex;
+
+            if (isSelected) {
+                roundedRect(ctx, panelX + 6, y + 2, panelW - 12, itemH - 4, 8);
+                ctx.fillStyle = 'rgba(125, 255, 180, 0.28)';
+                ctx.strokeStyle = 'rgba(125, 255, 180, 0.45)';
+                ctx.lineWidth = 1.2;
+                ctx.fill();
+                ctx.stroke();
+            }
+
+            if (item.id === 'cannon') {
+                const cdRemaining = getCannonCooldownRemaining();
+                if (cdRemaining > 0 && cannonState.cooldownMs > 0 && isSelected) {
+                    const ratio = clamp(cdRemaining / cannonState.cooldownMs, 0, 1);
+                    const overlayX = panelX + 6;
+                    const overlayY = y + 2;
+                    const overlayW = (panelW - 12) * ratio;
+                    const overlayH = itemH - 4;
+                    ctx.save();
+                    roundedRect(ctx, overlayX, overlayY, overlayW, overlayH, 8);
+                    ctx.fillStyle = 'rgba(125, 255, 180, 0.18)';
+                    ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
+                    ctx.lineWidth = 1;
+                    ctx.fill();
+                    ctx.stroke();
+                    ctx.restore();
+                }
+            }
+
+            ctx.fillStyle = isSelected ? 'rgba(210,255,235,0.97)' : 'rgba(169,197,222,0.9)';
+            ctx.font = '15px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+            ctx.textAlign = 'left';
+            ctx.textBaseline = 'middle';
+            const labelX = panelX + 14;
+            ctx.fillText(item.label, labelX + 18, y + itemH / 2);
+
+            // hotkey badge
+            ctx.textAlign = 'center';
+            ctx.font = '12px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+            ctx.fillStyle = isSelected ? 'rgba(200,255,235,0.9)' : 'rgba(169,197,222,0.75)';
+            const hotkey = (i === 0) ? '1' : (i === 1) ? '2' : `${i + 1}`;
+            roundedRect(ctx, panelX + 8, y + itemH / 2 - 10, 16, 20, 5);
+            ctx.strokeStyle = isSelected ? 'rgba(125, 255, 180, 0.45)' : 'rgba(255,255,255,0.12)';
+            ctx.lineWidth = 1;
+            ctx.stroke();
+            ctx.fillText(hotkey, panelX + 16, y + itemH / 2);
+
+            if (item.id === 'cannon') {
+                ctx.textAlign = 'right';
+                ctx.font = '13px ui-sans-serif,system-ui,Segoe UI,Roboto,Inter,Arial,sans-serif';
+                ctx.fillStyle = isSelected ? 'rgba(200,255,235,0.9)' : 'rgba(169,197,222,0.7)';
+                const ammoText = Number.isFinite(cannonState.ammo) ? `${Math.max(0, Math.floor(cannonState.ammo))}` : '∞';
+                ctx.fillText(ammoText, panelX + panelW - 14, y + itemH / 2);
+            }
+        }
+
+        ctx.restore();
+    }
+
     function drawRWR(ctx) {
         const radarSize = 200;
         const margin = 14;
@@ -1012,7 +1702,7 @@
 
         ctx.save();
 
-        const modeLabel = (player.rwrMode && ['SEARCH','LOCK','LAUNCH'].includes(player.rwrMode.toUpperCase()))
+        const modeLabel = (player.rwrMode && ['DETECTED','LOCK','LAUNCH'].includes(player.rwrMode.toUpperCase()))
             ? player.rwrMode.toUpperCase()
             : 'RWR';
 
@@ -1084,7 +1774,7 @@
         ctx.strokeStyle = 'rgba(125, 255, 180, 0.5)';
         ctx.lineWidth = 1.5;
         ctx.beginPath();
-        const nose = { x: 0, y: -radius * 0.42 };
+        const nose = { x: 0, y: -radius * 0.4 }; //.42
         const spineMid = { x: radius * 0.08, y: -radius * 0.18 };
         const wingTip = { x: radius * 0.34, y: -radius * 0.02 };
         const wingRoot = { x: wingTip.x, y: radius * 0.10 };
@@ -1097,7 +1787,11 @@
         ctx.lineTo(wingRoot.x, wingRoot.y);
         ctx.lineTo(wingInner.x, wingInner.y);
         ctx.lineTo(tailWing.x, tailWing.y);
+        ctx.lineTo(tailWing.x, tailWing.y + radius*0.10);
+        ctx.lineTo(-tailWing.x, tailWing.y + radius*0.10);
+
         ctx.lineTo(-tailWing.x, tailWing.y);
+
         ctx.lineTo(-wingInner.x, wingInner.y);
         ctx.lineTo(-wingRoot.x, wingRoot.y);
         ctx.lineTo(-wingTip.x, wingTip.y);
@@ -1194,10 +1888,11 @@
 
         drawHealthBar(ctx);
         drawRadar(ctx);
+        drawWeaponSelector(ctx);
         drawRWR(ctx);
 
         // core HUD elements
-        drawInfoPanel(ctx);
+        //exdrawInfoPanel(ctx);
         drawCenterReticle(ctx);
         drawTurnDemandBar(ctx);
     }

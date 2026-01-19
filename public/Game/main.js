@@ -13,6 +13,8 @@
     const DEFAULT_CHAT_COLOR = '#7DF5C3';
     if (chatInput) chatInput.maxLength = CHAT_MAX_LENGTH;
     let chatColor = DEFAULT_CHAT_COLOR;
+    let serverCoordLimit = null; // server clamp radius (anti-cheat)
+    let serverStormRadius = null; // visual border only; does not clamp
     const wctx = world.getContext('2d');
     const hctx = hud.getContext('2d');
 
@@ -886,6 +888,14 @@
                 player.id = data.player.id;
                 player.serverId = data.player.id;
             }
+            if (typeof data.coordLimit === 'number') {
+                serverCoordLimit = data.coordLimit;
+                window.serverCoordLimit = serverCoordLimit;
+            }
+            if (typeof data.storm === 'number') {
+                serverStormRadius = data.storm;
+                window.serverStormRadius = serverStormRadius;
+            }
             if (typeof data.player?.health === 'number') player.health = data.player.health;
             if (typeof data.player?.maxHealth === 'number') player.maxHealth = data.player.maxHealth;
             if (typeof data.player?.fuel === 'number') player.fuel = data.player.fuel;
@@ -959,6 +969,12 @@
                 for (const id of visibleTargets) previousRwrTargetIds.add(id);
                 player.rwrDirections = dirs;
             }
+        } else if (data?.type === 'world:coordLimit' && typeof data.coordLimit === 'number') {
+            serverCoordLimit = data.coordLimit;
+            window.serverCoordLimit = serverCoordLimit;
+        } else if (data?.type === 'world:storm' && typeof data.storm === 'number') {
+            serverStormRadius = data.storm;
+            window.serverStormRadius = serverStormRadius;
         } else if (data?.type === 'combat:damage') {
             const targetId = data.targetId;
             const isSelf = targetId && (targetId === player.serverId || targetId === player.id);
@@ -1132,6 +1148,7 @@
         wctx.scale(PPU, PPU);
         wctx.translate(-camera.x, -camera.y);
 
+            drawStorm(wctx);
             drawGrid(wctx);
             drawProjectiles(wctx);
             drawOtherJets(wctx);
@@ -1178,6 +1195,33 @@
             ctx.lineTo(right + gap, y);
             ctx.stroke();
         }
+    }
+
+    function drawStorm(ctx) {
+        if (typeof serverStormRadius !== 'number' || serverStormRadius <= 0) return;
+        const limit = serverStormRadius;
+        const halfW = (cw * 0.5) / PPU;
+        const halfH = (ch * 0.5) / PPU;
+        const left = camera.x - halfW;
+        const right = camera.x + halfW;
+        const top = camera.y - halfH;
+        const bottom = camera.y + halfH;
+
+        ctx.save();
+        ctx.fillStyle = 'rgba(255, 60, 60, 0.1)';
+        ctx.beginPath();
+        ctx.rect(left, top, right - left, bottom - top);
+        ctx.moveTo(limit, 0);
+        ctx.arc(0, 0, limit, 0, Math.PI * 2, true);
+        ctx.fill('evenodd');
+
+        ctx.strokeStyle = 'rgba(255, 120, 120, 0.5)';
+        ctx.lineWidth = 2 / PPU;
+        ctx.setLineDash([8, 6]);
+        ctx.beginPath();
+        ctx.arc(0, 0, limit, 0, Math.PI * 2);
+        ctx.stroke();
+        ctx.restore();
     }
 
     function drawProjectiles(ctx) {
@@ -1458,7 +1502,9 @@
 
         if (ratio > 0) {
             ctx.fillStyle = `rgba(${r}, ${g}, ${b}, 0.85)`;
-            roundedRect(ctx, trackX, trackY, trackW * ratio, barHeight, 7);
+            const fillW = trackW * ratio;
+            const fillR = Math.min(7, fillW * 0.5, barHeight * 0.5);
+            roundedRect(ctx, trackX, trackY, fillW, barHeight, fillR);
             ctx.fill();
         }
 
@@ -1648,8 +1694,9 @@
                     const overlayY = y + 2;
                     const overlayW = (panelW - 12) * ratio;
                     const overlayH = itemH - 4;
+                    const overlayR = Math.min(8, overlayW * 0.5, overlayH * 0.5);
                     ctx.save();
-                    roundedRect(ctx, overlayX, overlayY, overlayW, overlayH, 8);
+                    roundedRect(ctx, overlayX, overlayY, overlayW, overlayH, overlayR);
                     ctx.fillStyle = 'rgba(125, 255, 180, 0.18)';
                     ctx.strokeStyle = 'rgba(125, 255, 180, 0.35)';
                     ctx.lineWidth = 1;
@@ -1892,7 +1939,7 @@
         drawRWR(ctx);
 
         // core HUD elements
-        //exdrawInfoPanel(ctx);
+        //drawInfoPanel(ctx);
         drawCenterReticle(ctx);
         drawTurnDemandBar(ctx);
     }

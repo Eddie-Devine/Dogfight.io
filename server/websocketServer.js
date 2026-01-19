@@ -2,17 +2,26 @@ const http = require('http');
 const { WebSocketServer } = require('ws');
 const jwt = require('jsonwebtoken');
 
+//get constants from http server
 const {
 	JETS_BY_ID,
 	SESSION_COOKIE,
 	JWT_SECRET,
 } = require('./httpServer');
 
-const COORD_LIMIT = 1e6;
-const RADAR_PUSH_INTERVAL = 1000 / 30;
-const STATE_SYNC_INTERVAL = 100;
-const CHAT_HISTORY_LIMIT = 50;
-const CHAT_MAX_LENGTH = 280;
+const DEFAULT_COORD_LIMIT = 1e6; // world boundary clamp (fixed)
+const coordLimit = DEFAULT_COORD_LIMIT;
+const DEFAULT_STORM_RADIUS = 100; // visual border radius; does NOT clamp
+const STORM_TICK_MS = 100; // how often to step storm radius when tweening
+const STORM_DAMAGE_PER_SEC = 1; // damage applied per second while in storm
+let stormRadius = DEFAULT_STORM_RADIUS;
+let stormTarget = DEFAULT_STORM_RADIUS;
+let stormRatePerSec = 0;
+let stormTimer = null;
+const RADAR_PUSH_INTERVAL = 1000 / 30; //rate server updates radars
+const STATE_SYNC_INTERVAL = 100; //rate server updates state:sync
+const CHAT_HISTORY_LIMIT = 50; //number of messages kept in chat at one time
+const CHAT_MAX_LENGTH = 280; //max length of chat message
 const CHAT_COLORS = [
 	'#7DF5C3',
 	'#69B7DD',
@@ -26,9 +35,9 @@ const CHAT_COLORS = [
 	'#C5A3FF',
 	'#FFDE85',
 ];
-const MAX_DAMAGE_PER_HIT = 250;
-const CANNON_MUZZLE_SPEED = 600;         // world units per second
-const CANNON_PROJECTILE_TTL = 2500;      // ms
+const MAX_DAMAGE_PER_HIT = 250; //max damage a round can do
+const CANNON_MUZZLE_SPEED = 600;         //projectile speed = muzzle_speed + player speed
+const CANNON_PROJECTILE_TTL = 2500;      //how long projectiles live for
 const players = new Map();
 const chatHistory = [];
 
@@ -41,11 +50,27 @@ function parseCookies(header = '') {
 	}, {});
 }
 
-function clampCoord(value) {
-	if (!Number.isFinite(value)) return 0;
-	return Math.max(-COORD_LIMIT, Math.min(COORD_LIMIT, value));
+function clampPoint(pos = {}) {
+	const x = Number(pos.x);
+	const y = Number(pos.y);
+
+	// If either coordinate is not finite, fall back to zero for that axis.
+	const safeX = Number.isFinite(x) ? x : 0;
+	const safeY = Number.isFinite(y) ? y : 0;
+
+const max = Number.isFinite(coordLimit) ? coordLimit : 0;
+if (max <= 0) return { x: safeX, y: safeY };
+
+	const magSq = (safeX * safeX) + (safeY * safeY);
+	const maxSq = max * max;
+	if (magSq <= maxSq || magSq === 0) return { x: safeX, y: safeY };
+
+	const mag = Math.sqrt(magSq);
+	const scale = max / mag;
+	return { x: safeX * scale, y: safeY * scale };
 }
 
+//send payload to all players
 function broadcast(payload, excludeWs = null) {
 	const data = JSON.stringify(payload);
 	for (const p of players.values()) {
@@ -60,6 +85,65 @@ function broadcast(payload, excludeWs = null) {
 	}
 }
 
+function broadcastCoordLimit() {
+	broadcast({ type: 'world:coordLimit', coordLimit });
+}
+
+function broadcastStormRadius() {
+	broadcast({ type: 'world:storm', storm: stormRadius });
+}
+
+// coord limit is fixed; broadcast once on start/join
+
+function normalizeStormRadius(value) {
+	const n = Number(value);
+	return Number.isFinite(n) ? Math.max(0, n) : stormRadius;
+}
+
+function setStormRadius(nextRadius) {
+	stormRadius = normalizeStormRadius(nextRadius);
+	stormTarget = stormRadius;
+	stormRatePerSec = 0;
+	if (stormTimer) {
+		clearInterval(stormTimer);
+		stormTimer = null;
+	}
+	broadcastStormRadius();
+}
+
+function tweenStormRadius(targetRadius, unitsPerSecond) {
+	const target = normalizeStormRadius(targetRadius);
+	const speed = Math.max(0, Number(unitsPerSecond));
+	if (!Number.isFinite(speed) || speed <= 0 || target === stormRadius) {
+		setStormRadius(target);
+		return;
+	}
+
+	stormTarget = target;
+	stormRatePerSec = speed;
+	if (stormTimer) clearInterval(stormTimer);
+
+	stormTimer = setInterval(() => {
+		const dir = stormTarget >= stormRadius ? 1 : -1;
+		const step = stormRatePerSec * (STORM_TICK_MS / 1000);
+		let next = stormRadius + dir * step;
+		const reached = (dir > 0 && next >= stormTarget) || (dir < 0 && next <= stormTarget);
+		if (reached) next = stormTarget;
+
+		if (next !== stormRadius) {
+			stormRadius = next;
+			broadcastStormRadius();
+		}
+
+		if (reached) {
+			clearInterval(stormTimer);
+			stormTimer = null;
+			stormRatePerSec = 0;
+		}
+	}, STORM_TICK_MS);
+}
+
+//creates list of threats for RWRs
 function getThreatIds(targetId) {
 	const ids = [];
 	const target = players.get(targetId);
@@ -79,6 +163,7 @@ function getThreatIds(targetId) {
 	return ids;
 }
 
+//payload sent to player when they join sanitized
 function sanitizePlayerState(playerState) {
 	return {
 		id: playerState.id,
@@ -100,6 +185,7 @@ function sanitizePlayerState(playerState) {
 	};
 }
 
+//burns fuel based on player state
 function applyFuelBurn(state, reportedSpeed = 0) {
 	const now = Date.now();
 	const dt = Math.max(0, now - (state.lastFuelTick || now));
@@ -115,7 +201,8 @@ function applyFuelBurn(state, reportedSpeed = 0) {
 	}
 }
 
-function collectRadarContacts(observer, snapshots = false) {
+//gives radar contacts
+function collectRadarContacts(observer) {
 	const now = Date.now();
 	if ((observer.nextRadarPush || 0) > now) return observer.lastRadarContacts || [];
 	observer.nextRadarPush = now + RADAR_PUSH_INTERVAL;
@@ -132,27 +219,28 @@ function collectRadarContacts(observer, snapshots = false) {
 
 	for (const [id, target] of players) {
 		if (id === observer.id) continue;
-			const dx = target.pos.x - observer.pos.x;
-			const dy = target.pos.y - observer.pos.y;
-			const distSq = dx * dx + dy * dy;
-			if (distSq <= rangeSq) {
-				contacts.push({
-					id: target.id,
-					name: target.name,
-					pos: { x: target.pos.x, y: target.pos.y },
-					heading: target.heading || 0,
-					health: target.health,
-					maxHealth: target.maxHealth,
-				});
-				visibleIds.add(id);
-			}
+		const dx = target.pos.x - observer.pos.x;
+		const dy = target.pos.y - observer.pos.y;
+		const distSq = dx * dx + dy * dy;
+		if (distSq <= rangeSq) {
+			contacts.push({
+				id: target.id,
+				name: target.name,
+				pos: { x: target.pos.x, y: target.pos.y },
+				heading: target.heading || 0,
+				health: target.health,
+				maxHealth: target.maxHealth,
+			});
+			visibleIds.add(id);
 		}
+	}
 
 	observer.lastRadarContacts = contacts;
 	observer.visibleTargets = visibleIds;
 	return contacts;
 }
 
+//send player cannon info when they join
 function initCannonState(state, mechanics, num) {
 	const rate = Math.max(1, num(mechanics.cannonRate, 0));
 	const cooldownMs = Math.max(0, num(mechanics.cannonCooldown, 0));
@@ -265,7 +353,8 @@ function applyDamage(attackerId, targetId, amount, meta = {}) {
 	};
 	if (meta.weapon) hitEvent.weapon = meta.weapon;
 	if (meta.pos && typeof meta.pos.x === 'number' && typeof meta.pos.y === 'number') {
-		hitEvent.pos = { x: clampCoord(meta.pos.x), y: clampCoord(meta.pos.y) };
+		const clampedPos = clampPoint({ x: meta.pos.x, y: meta.pos.y });
+		hitEvent.pos = { x: clampedPos.x, y: clampedPos.y };
 	}
 
 	broadcast(hitEvent);
@@ -292,6 +381,7 @@ function createWebSocketServer(options = {}) {
 	const wsPath = options.path || process.env.WS_PATH || '/ws/';
 	const port = Number(options.port || process.env.WS_PORT || 3001);
 	const server = http.createServer();
+	let lastStormTick = Date.now();
 
 	const pickChatColor = () => {
 		const used = new Set();
@@ -308,13 +398,28 @@ function createWebSocketServer(options = {}) {
 	const wss = new WebSocketServer({ server, path: wsPath });
 	wss.players = players;
 	const syncTimer = setInterval(() => {
+		const now = Date.now();
+		const stormDt = Math.max(0, now - lastStormTick);
+		lastStormTick = now;
+		const stormActive = typeof stormRadius === 'number' && stormRadius > 0;
+		const stormRadiusSq = stormRadius * stormRadius;
+
 		for (const state of players.values()) {
+			if (stormActive && state.health > 0) {
+				const distSq = (state.pos.x * state.pos.x) + (state.pos.y * state.pos.y);
+				if (distSq > stormRadiusSq) {
+					const dmg = STORM_DAMAGE_PER_SEC * (stormDt / 1000);
+					if (dmg > 0) {
+						applyDamage('storm', state.id, dmg, { weapon: 'storm', pos: state.pos });
+					}
+				}
+			}
+
 			if (!state?.ws || state.ws.readyState !== state.ws.OPEN) continue;
 			const radarContacts = collectRadarContacts(state);
 
 			const threatIds = getThreatIds(state.id);
 			const trackedBy = threatIds.length > 0;
-			const now = Date.now();
 			const ammo = Number.isFinite(state.cannonAmmo) ? state.cannonAmmo : 0;
 			const cooldownRemaining = Math.max(0, (state.cannonCooldownUntil || 0) - now);
 
@@ -333,12 +438,19 @@ function createWebSocketServer(options = {}) {
 			} catch {
 				// ignore
 			}
-			}
+		}
 	}, STATE_SYNC_INTERVAL);
-	server.on('close', () => clearInterval(syncTimer));
+	server.on('close', () => {
+		clearInterval(syncTimer);
+		if (stormTimer) {
+			clearInterval(stormTimer);
+			stormTimer = null;
+			stormRatePerSec = 0;
+		}
+	});
 
-		wss.on('connection', (ws, req) => {
-			const cookies = parseCookies(req?.headers?.cookie || '');
+	wss.on('connection', (ws, req) => {
+		const cookies = parseCookies(req?.headers?.cookie || '');
 		const token = cookies[SESSION_COOKIE];
 
 		if (!token) {
@@ -360,22 +472,22 @@ function createWebSocketServer(options = {}) {
 			return;
 		}
 
-			const playerId = `${payload.name || 'anon'}:${payload.jet}`;
-			const mechanics = jet?.Mechanics || {};
-			const num = (val, fallback = 0) => {
-				const n = Number(val);
-				return Number.isFinite(n) ? n : fallback;
-			};
+		const playerId = `${payload.name || 'anon'}:${payload.jet}`;
+		const mechanics = jet?.Mechanics || {};
+		const num = (val, fallback = 0) => {
+			const n = Number(val);
+			return Number.isFinite(n) ? n : fallback;
+		};
 
-	const maxHealth = num(mechanics.maxHealth, 100);
-	const maxFuel = num(mechanics.maxFuel, 100);
-	const fuelRate = num(mechanics.fuelRate, 1000);
-	const maxSpeed = num(mechanics.maxSpeed, 1);
-	const radarDistance = num(mechanics.radarDistance, 0);
-	const rwrDistance = num(mechanics.RWRDistance ?? mechanics.rwrDistance, radarDistance);
+		const maxHealth = num(mechanics.maxHealth, 100);
+		const maxFuel = num(mechanics.maxFuel, 100);
+		const fuelRate = num(mechanics.fuelRate, 1000);
+		const maxSpeed = num(mechanics.maxSpeed, 1);
+		const radarDistance = num(mechanics.radarDistance, 0);
+		const rwrDistance = num(mechanics.RWRDistance ?? mechanics.rwrDistance, radarDistance);
 
-			if (players.has(playerId)) {
-				const existing = players.get(playerId);
+		if (players.has(playerId)) {
+			const existing = players.get(playerId);
 			if (existing.ws && existing.ws !== ws) {
 				existing.ws.close(4001, 'Session superseded');
 			}
@@ -390,194 +502,220 @@ function createWebSocketServer(options = {}) {
 			maxHealth,
 			fuel: maxFuel,
 			maxFuel,
-		fuelRate,
-		maxSpeed,
-		radarDistance,
-		rwrDistance,
-		heading: 0,
-		ws,
-		lastUpdate: Date.now(),
+			fuelRate,
+			maxSpeed,
+			radarDistance,
+			rwrDistance,
+			heading: 0,
+			ws,
+			lastUpdate: Date.now(),
 			lastFuelTick: Date.now(),
 			nextRadarPush: Date.now(),
 		};
-	state.chatColor = pickChatColor();
-	initCannonState(state, mechanics, num);
+		state.chatColor = pickChatColor();
+		initCannonState(state, mechanics, num);
 
 		players.set(playerId, state);
 
-				ws.send(JSON.stringify({
-					type: 'session:init',
-					player: sanitizePlayerState(state),
-					chatColor: state.chatColor,
-					jet,
-				}));
+		ws.send(JSON.stringify({
+			type: 'session:init',
+			player: sanitizePlayerState(state),
+			chatColor: state.chatColor,
+			jet,
+			coordLimit,
+			storm: stormRadius,
+		}));
 
-				if (chatHistory.length > 0) {
-					ws.send(JSON.stringify({ type: 'chat:history', messages: chatHistory }));
-				}
+		if (chatHistory.length > 0) {
+			ws.send(JSON.stringify({ type: 'chat:history', messages: chatHistory }));
+		}
 
-			const joinMessage = {
-				type: 'chat:message',
-				from: { id: 'server', name: 'Server', jetId: null, color: '#9FE3FF' },
-				text: `${state.name || 'Player'} joined the fight`,
-				at: Date.now(),
-			};
-			chatHistory.push(joinMessage);
-			if (chatHistory.length > CHAT_HISTORY_LIMIT) {
-				chatHistory.shift();
+		const joinMessage = {
+			type: 'chat:message',
+			from: { id: 'server', name: 'Server', jetId: null, color: '#9FE3FF' },
+			text: `${state.name || 'Player'} joined the fight`,
+			at: Date.now(),
+		};
+		chatHistory.push(joinMessage);
+		if (chatHistory.length > CHAT_HISTORY_LIMIT) {
+			chatHistory.shift();
+		}
+		for (const playerState of players.values()) {
+			const targetWs = playerState.ws;
+			if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
+			try {
+				targetWs.send(JSON.stringify(joinMessage));
+			} catch {
+				// ignore send failure
 			}
-			for (const playerState of players.values()) {
-				const targetWs = playerState.ws;
-				if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
-				try {
-					targetWs.send(JSON.stringify(joinMessage));
-				} catch {
-					// ignore send failure
-				}
-			}
+		}
 
-				ws.on('message', (data) => {
-					if (!data) return;
-					let msg;
-					try {
-					msg = JSON.parse(data.toString());
+		ws.on('message', (data) => {
+			if (!data) return;
+			let msg;
+			try {
+				msg = JSON.parse(data.toString());
 			} catch {
 				return;
 			}
 
-				if (msg?.type === 'state:update') {
-					const reportedSpeed = typeof msg.speed === 'number' ? Math.max(0, msg.speed) : 0;
-					if (typeof msg.pos?.x === 'number') state.pos.x = clampCoord(msg.pos.x);
-					if (typeof msg.pos?.y === 'number') state.pos.y = clampCoord(msg.pos.y);
-					if (typeof msg.heading === 'number') state.heading = Number(msg.heading);
-					state.speed = reportedSpeed;
-					applyFuelBurn(state, reportedSpeed);
-					state.lastUpdate = Date.now();
+			if (msg?.type === 'state:update') {
+				const reportedSpeed = typeof msg.speed === 'number' ? Math.max(0, msg.speed) : 0;
+				const hasPosX = typeof msg.pos?.x === 'number';
+				const hasPosY = typeof msg.pos?.y === 'number';
+				if (hasPosX || hasPosY) {
+					const clampedPos = clampPoint({
+						x: hasPosX ? msg.pos.x : state.pos.x,
+						y: hasPosY ? msg.pos.y : state.pos.y,
+					});
+					state.pos.x = clampedPos.x;
+					state.pos.y = clampedPos.y;
+				}
+				if (typeof msg.heading === 'number') state.heading = Number(msg.heading);
+				state.speed = reportedSpeed;
+				applyFuelBurn(state, reportedSpeed);
+				state.lastUpdate = Date.now();
 
+				try {
+					const radarContacts = collectRadarContacts(state);
+
+					const threatIds = getThreatIds(state.id);
+					const trackedBy = threatIds.length > 0;
+
+					ws.send(JSON.stringify({
+						type: 'state:sync',
+						fuel: state.fuel,
+						health: state.health,
+						radar: radarContacts,
+						rwr: { detected: trackedBy, targets: threatIds },
+					}));
+				} catch {
+					// ignore send failure
+				}
+			} else if (msg?.type === 'combat:damage') {
+				const targetId = typeof msg.targetId === 'string' ? msg.targetId : null;
+				const amount = Number(msg.amount);
+				if (!targetId || targetId === state.id) return;
+
+				const weapon = typeof msg.weapon === 'string' ? msg.weapon : undefined;
+				const pos = (msg.pos && typeof msg.pos.x === 'number' && typeof msg.pos.y === 'number')
+					? { x: msg.pos.x, y: msg.pos.y }
+					: undefined;
+
+				if (weapon === 'cannon') {
+					if (!state.cannonPendingShots || state.cannonPendingShots <= 0) return;
+					state.cannonPendingShots -= 1;
+				}
+
+				applyDamage(state.id, targetId, amount, { weapon, pos });
+			} else if (msg?.type === 'combat:fire') {
+				const weapon = typeof msg.weapon === 'string' ? msg.weapon : null;
+				if (weapon !== 'cannon') return;
+				const result = handleCannonFire(state);
+				try {
+					ws.send(JSON.stringify({
+						type: 'combat:fire:ack',
+						weapon: 'cannon',
+						allowed: result.allowed,
+						ammo: state.cannonAmmo,
+						cooldownRemaining: result.cooldownRemaining || 0,
+						burstRemaining: result.burstRemaining ?? null,
+						reason: result.allowed ? undefined : result.reason,
+					}));
+				} catch {
+					// ignore
+				}
+				if (result.allowed && result.projectile) {
+					const payload = {
+						type: 'combat:projectile',
+						weapon: 'cannon',
+						shooterId: state.id,
+						pos: result.projectile.pos,
+						vel: result.projectile.vel,
+						ttlMs: result.projectile.ttlMs,
+						at: result.projectile.at,
+					};
+					broadcast(payload, ws);
+				}
+			} else if (msg?.type === 'chat:send' && typeof msg.text === 'string') {
+				const text = msg.text.trim().slice(0, CHAT_MAX_LENGTH);
+				if (text.length === 0) return;
+
+				const entry = {
+					type: 'chat:message',
+					from: { id: state.id, name: state.name, jetId: state.jetId, color: state.chatColor },
+					text,
+					at: Date.now(),
+				};
+
+				chatHistory.push(entry);
+				if (chatHistory.length > CHAT_HISTORY_LIMIT) {
+					chatHistory.shift();
+				}
+
+				for (const playerState of players.values()) {
+					const targetWs = playerState.ws;
+					if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
 					try {
-						const radarContacts = collectRadarContacts(state);
-
-						const threatIds = getThreatIds(state.id);
-						const trackedBy = threatIds.length > 0;
-
-						ws.send(JSON.stringify({
-							type: 'state:sync',
-							fuel: state.fuel,
-							health: state.health,
-							radar: radarContacts,
-							rwr: { detected: trackedBy, targets: threatIds },
-						}));
+						targetWs.send(JSON.stringify(entry));
 					} catch {
 						// ignore send failure
 					}
-					} else if (msg?.type === 'combat:damage') {
-						const targetId = typeof msg.targetId === 'string' ? msg.targetId : null;
-						const amount = Number(msg.amount);
-						if (!targetId || targetId === state.id) return;
-
-						const weapon = typeof msg.weapon === 'string' ? msg.weapon : undefined;
-						const pos = (msg.pos && typeof msg.pos.x === 'number' && typeof msg.pos.y === 'number')
-							? { x: msg.pos.x, y: msg.pos.y }
-							: undefined;
-
-						if (weapon === 'cannon') {
-							if (!state.cannonPendingShots || state.cannonPendingShots <= 0) return;
-							state.cannonPendingShots -= 1;
-						}
-
-						applyDamage(state.id, targetId, amount, { weapon, pos });
-					} else if (msg?.type === 'combat:fire') {
-						const weapon = typeof msg.weapon === 'string' ? msg.weapon : null;
-						if (weapon !== 'cannon') return;
-						const result = handleCannonFire(state);
-						try {
-							ws.send(JSON.stringify({
-								type: 'combat:fire:ack',
-								weapon: 'cannon',
-								allowed: result.allowed,
-								ammo: state.cannonAmmo,
-								cooldownRemaining: result.cooldownRemaining || 0,
-								burstRemaining: result.burstRemaining ?? null,
-								reason: result.allowed ? undefined : result.reason,
-							}));
-						} catch {
-							// ignore
-						}
-						if (result.allowed && result.projectile) {
-							const payload = {
-								type: 'combat:projectile',
-								weapon: 'cannon',
-								shooterId: state.id,
-								pos: result.projectile.pos,
-								vel: result.projectile.vel,
-								ttlMs: result.projectile.ttlMs,
-								at: result.projectile.at,
-							};
-							broadcast(payload, ws);
-						}
-					} else if (msg?.type === 'chat:send' && typeof msg.text === 'string') {
-						const text = msg.text.trim().slice(0, CHAT_MAX_LENGTH);
-						if (text.length === 0) return;
-
-						const entry = {
-						type: 'chat:message',
-						from: { id: state.id, name: state.name, jetId: state.jetId, color: state.chatColor },
-						text,
-						at: Date.now(),
-					};
-
-					chatHistory.push(entry);
-					if (chatHistory.length > CHAT_HISTORY_LIMIT) {
-						chatHistory.shift();
-					}
-
-					for (const playerState of players.values()) {
-						const targetWs = playerState.ws;
-						if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
-						try {
-							targetWs.send(JSON.stringify(entry));
-						} catch {
-							// ignore send failure
-						}
-					}
 				}
-			});
-
-			ws.on('close', () => {
-				const tracked = players.get(playerId);
-				if (tracked && tracked.ws === ws) {
-					const leaveMessage = {
-						type: 'chat:message',
-						from: { id: 'server', name: 'Server', jetId: null, color: '#9FE3FF' },
-						text: `${tracked.name || 'Player'} left the fight`,
-						at: Date.now(),
-					};
-					chatHistory.push(leaveMessage);
-					if (chatHistory.length > CHAT_HISTORY_LIMIT) {
-						chatHistory.shift();
-					}
-					for (const playerState of players.values()) {
-						const targetWs = playerState.ws;
-						if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
-						try {
-							targetWs.send(JSON.stringify(leaveMessage));
-						} catch {
-							// ignore send failure
-						}
-					}
-					players.delete(playerId);
-				}
-			});
+			}
 		});
+
+		ws.on('close', () => {
+			const tracked = players.get(playerId);
+			if (tracked && tracked.ws === ws) {
+				const leaveMessage = {
+					type: 'chat:message',
+					from: { id: 'server', name: 'Server', jetId: null, color: '#9FE3FF' },
+					text: `${tracked.name || 'Player'} left the fight`,
+					at: Date.now(),
+				};
+				chatHistory.push(leaveMessage);
+				if (chatHistory.length > CHAT_HISTORY_LIMIT) {
+					chatHistory.shift();
+				}
+				for (const playerState of players.values()) {
+					const targetWs = playerState.ws;
+					if (!targetWs || targetWs.readyState !== targetWs.OPEN) continue;
+					try {
+						targetWs.send(JSON.stringify(leaveMessage));
+					} catch {
+						// ignore send failure
+					}
+				}
+				players.delete(playerId);
+			}
+		});
+	});
 
 	server.listen(port, () => {
 		const address = server.address();
 		const host = address?.address && address.address !== '::' ? address.address : 'localhost';
 		const portInfo = address?.port ? `:${address.port}` : '';
 		console.log(`WebSocket server listening on ws://${host}${portInfo}${wsPath}`);
+		broadcastStormRadius();
 	});
 
-	return { server, wss };
+	return {
+		server,
+		wss,
+		getCoordLimit: () => coordLimit,
+		setStormRadius,
+		tweenStormRadius,
+		getStormRadius: () => stormRadius,
+	};
 }
 
-	module.exports = { createWebSocketServer };
+setStormRadius(1000);
+
+module.exports = {
+	createWebSocketServer,
+	getCoordLimit: () => coordLimit,
+	setStormRadius,
+	tweenStormRadius,
+	getStormRadius: () => stormRadius,
+};

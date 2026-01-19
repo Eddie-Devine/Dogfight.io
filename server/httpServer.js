@@ -151,9 +151,7 @@ function createHttpServer(options = {}) {
 
 module.exports = {
 	createHttpServer,
-	requireSession,
 	JETS_BY_ID,
-	JET_WHITELIST,
 	SESSION_COOKIE,
 	JWT_SECRET,
 };

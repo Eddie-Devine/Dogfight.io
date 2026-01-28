@@ -7,7 +7,7 @@ const PORT = 3000;
 const JWT_SECRET = 'DEV_ONLY_CHANGE_ME';
 
 const VALID_GAMEMODES = ['freeforall'];
-const FREE_JETS = ['F22'];
+const FREE_JETS = ['F22', 'A10'];
 const DEFAULT_CALLSIGNS = [
 	'Maverick', 'Iceman', 'Goose', 'Viper', 'Jester',
 	'Cougar', 'Merlin', 'Sundown', 'Chipper', 'Hollywood'
@@ -46,7 +46,7 @@ app.ws('/game/freeforall', (ws, req) => {
 	const token = req.query.token;
 
 	// Server keeps these constants
-	const WORLD_SIZE = 5000;
+	const WORLD_SIZE = 10000;
 
 	if (!token) {
 		ws.close(4401, 'Missing token');
@@ -70,19 +70,7 @@ app.ws('/game/freeforall', (ws, req) => {
 			x: 0,
 			y: 0
 		},
-		worldSize: WORLD_SIZE
-	}));
-
-	console.log(JSON.stringify({
-		type: 'session:init',
-		callsign: playerData.callsign,
-		gamemode: playerData.gamemode,
-		jet: playerData.jet,
-		pos: {
-			x: 0,
-			y: 0
-		},
-		worldSize: WORLD_SIZE
+		worldSize: WORLD_SIZE,
 	}));
 
 	ws.on('message', (message) => {

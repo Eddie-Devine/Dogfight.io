@@ -2,11 +2,12 @@ import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
 // jetConfig.js
-export const JET_CONFIG = {
+const JET_CONFIG = {
 	'F22': {
 		scale: 10,
-		rotation: { x: 0, y: THREE.MathUtils.degToRad(-90), z: 0 },
-		offset: { x: 0, y: 0, z: 0 }
+	},
+	'A10': {
+		scale: 10,
 	}
 };
 
@@ -84,12 +85,61 @@ function startClientGame(session) {
 	renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
 	const scene = new THREE.Scene();
-	const camera = setupCamera(session);
+	const camera = setupCamera();
 
 	setupWorld(scene, session);
 	loadPlayerJet(scene, session.jet);
+
+	// ADD THIS LINE
+	const directionArrow = createDirectionArrow(scene);
+
 	setupResizeHandler(camera, renderer, VIEW_HEIGHT);
-	startRenderLoop(renderer, scene, camera);
+	// PASS THE ARROW TO THE RENDER LOOP
+	startRenderLoop(renderer, scene, camera, directionArrow);
+}
+
+function createDirectionArrow(scene) {
+	// Create a small triangle that points upward (towards +Z in world space)
+	const shape = new THREE.Shape();
+	const size = 15; // Size of the arrow
+	shape.moveTo(0, size); // tip
+	shape.lineTo(-size * 0.5, -size * 0.5); // bottom left
+	shape.lineTo(size * 0.5, -size * 0.5); // bottom right
+	shape.lineTo(0, size); // back to tip
+
+	const geometry = new THREE.ShapeGeometry(shape);
+	const material = new THREE.MeshBasicMaterial({
+		color: 0x00ff00,
+		side: THREE.DoubleSide,
+		transparent: true,
+		opacity: 0.8
+	});
+
+	const arrow = new THREE.Mesh(geometry, material);
+	arrow.rotation.x = -Math.PI / 2; // Lay it flat on the ground
+	arrow.position.y = 1; // Slightly above ground to avoid z-fighting
+
+	scene.add(arrow);
+	return arrow;
+}
+
+function updateDirectionArrow(arrow, jetPosition, mouseWorldX, mouseWorldZ) {
+	if (!arrow) return;
+
+	// Calculate angle from jet to mouse
+	const dx = mouseWorldX - jetPosition.x;
+	const dz = mouseWorldZ - jetPosition.z;
+	const targetAngle = Math.atan2(dx, dz);
+
+	// Position arrow around the jet at a fixed radius
+	const radius = 80; // Distance from jet center
+	arrow.position.x = jetPosition.x + Math.sin(targetAngle) * radius;
+	arrow.position.z = jetPosition.z + Math.cos(targetAngle) * radius;
+
+	// Rotate arrow to point away from center (outward)
+	// Since the arrow tip points toward +Y in local space (before x rotation),
+	// and we rotated it to lie flat, rotation.z controls which way it points
+	arrow.rotation.z = targetAngle + Math.PI;
 }
 
 function setupCanvas() {
@@ -120,7 +170,7 @@ function hideMenu() {
 
 function setupWorld(scene, session) {
 	const gridSize = session.worldSize;
-	const divisions = 150;
+	const divisions = gridSize / 50; //each box is x world units
 
 	// Ground plane
 	const geometry = new THREE.PlaneGeometry(gridSize, gridSize);
@@ -140,7 +190,7 @@ function setupWorld(scene, session) {
 	scene.add(gridHelper);
 }
 
-function setupCamera(session) {
+function setupCamera() {
 	const viewHeight = VIEW_HEIGHT;
 	const aspect = window.innerWidth / window.innerHeight;
 	const viewWidth = viewHeight * aspect;
@@ -185,37 +235,28 @@ function setupResizeHandler(camera, renderer, viewHeight) {
 	});
 }
 
-function startRenderLoop(renderer, scene, camera) {
-	function animate() {
+let degrees = 0;
+
+function startRenderLoop(renderer, scene, camera, directionArrow) {
+	let lastTime = performance.now();
+
+	function animate(currentTime) {
 		requestAnimationFrame(animate);
+		const deltaTime = (currentTime - lastTime) / 1000;
+		lastTime = currentTime;
+		const jet = window.playerJet;
+		if (!jet) return;
 
-		if (window.playerJet && mouse.worldX !== undefined) {
-			const jet = window.playerJet;
+		// UPDATE THE ARROW POSITION AND ROTATION
+		updateDirectionArrow(directionArrow, jet.position, mouse.worldX, mouse.worldZ);
 
-			// Calculate direction to mouse
-			const dx = mouse.worldX - jet.position.x;
-			const dz = mouse.worldZ - jet.position.z;
-			const distance = Math.sqrt(dx * dx + dz * dz);
-
-			// Only move if not already at mouse position
-			if (distance > 5) {
-				// Normalize direction and move
-				jet.position.x += (dx / distance) * 3;
-				jet.position.z += (dz / distance) * 3;
-
-				// Rotate to face movement direction
-				jet.rotation.y = Math.atan2(dx, dz);
-			}
-
-			// Camera follows jet
-			camera.position.x = jet.position.x;
-			camera.position.z = jet.position.z;
-			camera.lookAt(jet.position.x, 0, jet.position.z);
-		}
+		let radians = degrees * (Math.PI / 180);
+		jet.rotation.z = radians;
+		degrees += 2;
 
 		renderer.render(scene, camera);
 	}
-	animate();
+	animate(performance.now());
 }
 
 function loadPlayerJet(scene, jetModel) {
@@ -223,20 +264,18 @@ function loadPlayerJet(scene, jetModel) {
 
 	loader.load(`/Models/${jetModel}/scene.gltf`, (gltf) => {
 		const jet = gltf.scene;
-
 		const config = JET_CONFIG[jetModel];
 
 		jet.scale.set(config.scale, config.scale, config.scale);
-		jet.rotation.set(config.rotation.x, config.rotation.y, config.rotation.z);
-		jet.position.set(config.offset.x, config.offset.y, config.offset.z);
+
+		const box = new THREE.BoxHelper(jet, 0xff0000);
+		scene.add(box);
+
+		jet.rotation.z = Math.PI / 6; // Bank left 30 degrees
 
 		scene.add(jet);
 
-		const box = new THREE.BoxHelper(jet, 0xff0000); // Red box
-		scene.add(box);
-
-		// Store reference for later updates
-		window.playerJet = jet;
+		window.playerJet = jet; // instead of playerJetModel
 	}, undefined, (error) => {
 		console.error('Error loading jet model:', error);
 	});
@@ -329,7 +368,7 @@ function loadPlayerJet(scene, jetModel) {
 
 // Hold-to-start behavior for the Take Off button
 (() => {
-	const HOLD_MS = 600;
+	const HOLD_MS = 0;
 	const takeoffBtn = document.getElementById('takeoffBtn');
 	if (!takeoffBtn) return;
 

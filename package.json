@@ -1,32 +1,27 @@
 {
   "name": "dogfight.io",
-  "version": "1.0.0",
-  "description": "A 2D dogfighting IO game for the browser.",
-  "main": "Server.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node scripts/manage-stack.js start",
-    "stop": "node scripts/manage-stack.js stop",
-    "restart": "sudo npm stop && sudo npm start"
+  "version": "2.0.0",
+  "description": "",
+  "homepage": "https://github.com/Eddie-Devine/Dogfight.io#readme",
+  "bugs": {
+    "url": "https://github.com/Eddie-Devine/Dogfight.io/issues"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/Eddie-Devine/Dogfight.io.git"
   },
   "author": "Eddie Devine",
-  "license": "SEE LICENSE IN LICENSE.txt",
-  "bugs": {
-    "url": "https://github.com/Eddie-Devine/Dogfight.io/issues"
+  "type": "commonjs",
+  "main": "Server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "ws": "node websocketServer.js"
   },
-  "homepage": "https://github.com/Eddie-Devine/Dogfight.io#readme",
   "dependencies": {
-    "cookie-parser": "^1.4.7",
-    "cors": "^2.8.5",
-    "express": "^5.1.0",
-    "helmet": "^8.1.0",
-    "jsonwebtoken": "^9.0.2",
-    "morgan": "^1.10.1",
-    "serve-favicon": "^2.5.1",
-    "ws": "^8.18.3"
+    "express": "^4.22.1",
+    "express-ws": "^5.0.2",
+    "jsonwebtoken": "^9.0.3",
+    "ws": "^8.19.0"
   }
 }

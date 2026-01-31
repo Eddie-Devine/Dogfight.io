@@ -5,16 +5,33 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 const JET_CONFIG = {
 	'F22': {
 		scale: 10,
+		maxBankAngle: 90,
+		maxTurnRate: 100, // degrees per second at optimal speed
+		optimalTurnSpeed: 250, // speed where turning is best
+		minSpeed: 100,
+		maxSpeed: 500,
 	},
 	'A10': {
 		scale: 10,
+		maxBankAngle: 60,
+		maxTurnRate: 60,
+		optimalTurnSpeed: 250,
+		minSpeed: 80,
+		maxSpeed: 400,
 	}
 };
 
 const mouse = { x: 0, y: 0, worldX: 0, worldZ: 0 };
 
+const flightState = {
+	heading: 0, // current heading in degrees (0 = south)
+	speed: 250, // current speed
+	position: { x: 0, z: 0 },
+	bankAngle: 0
+};
+
 let menuActive = true;
-const VIEW_HEIGHT = 800;
+const VIEW_HEIGHT = 1000;
 
 async function initGuest() {
 	try {
@@ -90,12 +107,83 @@ function startClientGame(session) {
 	setupWorld(scene, session);
 	loadPlayerJet(scene, session.jet);
 
-	// ADD THIS LINE
+
 	const directionArrow = createDirectionArrow(scene);
 
 	setupResizeHandler(camera, renderer, VIEW_HEIGHT);
-	// PASS THE ARROW TO THE RENDER LOOP
-	startRenderLoop(renderer, scene, camera, directionArrow);
+
+	startRenderLoop(renderer, scene, camera, directionArrow, session.jet);
+}
+
+//calculates the shortest rotation between two angles (handles the wraparound from 359° to 0°
+function angleDifference(target, current) {
+	let diff = target - current;
+	// Normalize to -180 to +180
+	while (diff > 180) diff -= 360;
+	while (diff < -180) diff += 360;
+	return diff;
+}
+
+// Calculate turn rate based on speed (g-force mechanics)
+function calculateTurnRate(speed, config) {
+	const { maxTurnRate, optimalTurnSpeed, minSpeed, maxSpeed } = config;
+
+	// Calculate how far we are from optimal speed
+	const speedDiff = Math.abs(speed - optimalTurnSpeed);
+	const maxDiff = Math.max(optimalTurnSpeed - minSpeed, maxSpeed - optimalTurnSpeed);
+
+	// Turn rate is best at optimal speed, decreases as you get faster or slower
+	// Using a parabolic curve centered at optimal speed
+	const efficiency = 1 - (speedDiff / maxDiff) * 0.6; // 0.6 = how much slower turning gets
+
+	return maxTurnRate * efficiency;
+}
+
+function updateJetPhysics(jet, config, deltaTime) {
+	if (!jet) return;
+
+	// Calculate angle to mouse cursor
+	const dx = mouse.worldX - flightState.position.x;
+	const dz = mouse.worldZ - flightState.position.z;
+	const targetHeading = Math.atan2(dx, dz) * (180 / Math.PI); // Convert to degrees
+
+	// Calculate how much we need to turn
+	const headingDiff = angleDifference(targetHeading, flightState.heading);
+
+	// Get current turn rate based on speed
+	const currentTurnRate = calculateTurnRate(flightState.speed, config);
+
+	// Apply turn (limited by turn rate)
+	const turnAmount = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), currentTurnRate * deltaTime);
+	flightState.heading += turnAmount;
+
+	// Normalize heading to 0-360
+	while (flightState.heading >= 360) flightState.heading -= 360;
+	while (flightState.heading < 0) flightState.heading += 360;
+
+	// Update position based on heading and speed
+	const headingRad = flightState.heading * (Math.PI / 180);
+	const velocityX = Math.sin(headingRad) * flightState.speed * deltaTime; // 0.016 ≈ 1/60 for smooth movement
+	const velocityZ = Math.cos(headingRad) * flightState.speed * deltaTime;
+
+	flightState.position.x += velocityX;
+	flightState.position.z += velocityZ;
+
+	// Update jet visual position and rotation
+	jet.position.x = flightState.position.x;
+	jet.position.z = flightState.position.z;
+
+	jet.rotation.y = headingRad + (180 * (Math.PI / 180)); //extra 180 degrees added at the end to fix bug DONT REMOVE
+
+	// Calculate target bank angle based on turn rate
+	const targetBankAngle = (turnAmount / (currentTurnRate * deltaTime)) * config.maxBankAngle;
+
+	// Smoothly interpolate current bank angle towards target
+	const bankSmoothness = 5; // Higher = faster response, lower = smoother
+	flightState.bankAngle += (targetBankAngle - flightState.bankAngle) * Math.min(deltaTime * bankSmoothness, 1);
+
+	// Apply the smoothed bank angle
+	jet.rotation.z = flightState.bankAngle * (Math.PI / 180);
 }
 
 function createDirectionArrow(scene) {
@@ -123,18 +211,22 @@ function createDirectionArrow(scene) {
 	return arrow;
 }
 
-function updateDirectionArrow(arrow, jetPosition, mouseWorldX, mouseWorldZ) {
+function updateDirectionArrow(arrow, jet, mouseWorldX, mouseWorldZ) {
 	if (!arrow) return;
 
 	// Calculate angle from jet to mouse
-	const dx = mouseWorldX - jetPosition.x;
-	const dz = mouseWorldZ - jetPosition.z;
+	const dx = mouseWorldX - jet.position.x;
+	const dz = mouseWorldZ - jet.position.z;
 	const targetAngle = Math.atan2(dx, dz);
 
 	// Position arrow around the jet at a fixed radius
-	const radius = 80; // Distance from jet center
-	arrow.position.x = jetPosition.x + Math.sin(targetAngle) * radius;
-	arrow.position.z = jetPosition.z + Math.cos(targetAngle) * radius;
+	const box = new THREE.Box3().setFromObject(jet);
+	const sphere = new THREE.Sphere();
+	box.getBoundingSphere(sphere);
+	const radius = sphere.radius;
+
+	arrow.position.x = jet.position.x + Math.sin(targetAngle) * radius;
+	arrow.position.z = jet.position.z + Math.cos(targetAngle) * radius;
 
 	// Rotate arrow to point away from center (outward)
 	// Since the arrow tip points toward +Y in local space (before x rotation),
@@ -212,14 +304,21 @@ function setupCamera() {
 		mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
 
 		// Convert to world coordinates
-		const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
-		vector.unproject(camera);
+		// const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
+		// vector.unproject(camera);
 
-		mouse.worldX = vector.x;
-		mouse.worldZ = vector.z;
+		// mouse.worldX = vector.x;
+		// mouse.worldZ = vector.z;
 	});
 
 	return camera;
+}
+
+//updates camera position to follow player
+function updateCamera(camera, jet) {
+	camera.position.x = jet.position.x;
+	camera.position.z = jet.position.z;
+	camera.lookAt(jet.position.x, 0, jet.position.z);
 }
 
 function setupResizeHandler(camera, renderer, viewHeight) {
@@ -235,28 +334,37 @@ function setupResizeHandler(camera, renderer, viewHeight) {
 	});
 }
 
-let degrees = 0;
+//Update mouse world coordinates based on current camera position
+//mouse position needs to based off world coordinates for use in game
+function updateMouseWorldPosition(camera) {
+	const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
+	vector.unproject(camera);
+	mouse.worldX = vector.x;
+	mouse.worldZ = vector.z;
+}
 
-function startRenderLoop(renderer, scene, camera, directionArrow) {
-	let lastTime = performance.now();
+function startRenderLoop(renderer, scene, camera, directionArrow, jetModelName) {
+	const config = JET_CONFIG[jetModelName];
+	let lastTime = 0;
 
 	function animate(currentTime) {
 		requestAnimationFrame(animate);
-		const deltaTime = (currentTime - lastTime) / 1000;
-		lastTime = currentTime;
 		const jet = window.playerJet;
 		if (!jet) return;
 
-		// UPDATE THE ARROW POSITION AND ROTATION
-		updateDirectionArrow(directionArrow, jet.position, mouse.worldX, mouse.worldZ);
+		const deltaTime = (currentTime - lastTime) / 1000;
+		lastTime = currentTime;
 
-		let radians = degrees * (Math.PI / 180);
-		jet.rotation.z = radians;
-		degrees += 2;
+		//jet.rotation.z = radians;
+
+		updateCamera(camera, jet);
+		updateMouseWorldPosition(camera);
+		updateJetPhysics(jet, config, deltaTime);
+		updateDirectionArrow(directionArrow, jet, mouse.worldX, mouse.worldZ);
 
 		renderer.render(scene, camera);
 	}
-	animate(performance.now());
+	animate(0);
 }
 
 function loadPlayerJet(scene, jetModel) {
@@ -268,14 +376,9 @@ function loadPlayerJet(scene, jetModel) {
 
 		jet.scale.set(config.scale, config.scale, config.scale);
 
-		const box = new THREE.BoxHelper(jet, 0xff0000);
-		scene.add(box);
-
-		jet.rotation.z = Math.PI / 6; // Bank left 30 degrees
-
 		scene.add(jet);
 
-		window.playerJet = jet; // instead of playerJetModel
+		window.playerJet = jet;
 	}, undefined, (error) => {
 		console.error('Error loading jet model:', error);
 	});

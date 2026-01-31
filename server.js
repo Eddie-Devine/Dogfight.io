@@ -46,7 +46,7 @@ app.ws('/game/freeforall', (ws, req) => {
 	const token = req.query.token;
 
 	// Server keeps these constants
-	const WORLD_SIZE = 10000;
+	const WORLD_SIZE = 30000;
 
 	if (!token) {
 		ws.close(4401, 'Missing token');
@@ -77,7 +77,6 @@ app.ws('/game/freeforall', (ws, req) => {
 
 	});
 });
-
 
 app.use(express.static(path.join(__dirname, 'Public'), { etag: false, lastModified: false }));
 app.use(express.json());
@@ -136,8 +135,9 @@ app.post('/init/guest', (req, res) => {
 	res.json({ token, gamemode });
 });
 
+//404 just sends users to main menu
 app.get('*', (req, res) => {
-	res.sendFile(path.join(__dirname, 'Public', 'index.html'));
+	res.redirect('/');
 });
 
 app.listen(PORT, () => {

@@ -2,6 +2,7 @@ const express = require('express');
 const expressWs = require('express-ws');
 const path = require('path');
 const JWT = require('jsonwebtoken');
+const crypto = require('crypto');
 
 const PORT = 3000;
 const JWT_SECRET = 'DEV_ONLY_CHANGE_ME';
@@ -12,13 +13,31 @@ const DEFAULT_CALLSIGNS = [
 	'Maverick', 'Iceman', 'Goose', 'Viper', 'Jester',
 	'Cougar', 'Merlin', 'Sundown', 'Chipper', 'Hollywood'
 ];
-
-const app = express();
-expressWs(app);
+const JET_CONFIG = {
+	'F22': {
+		scale: 10,
+		maxBankAngle: 90,
+		maxTurnRate: 100, // degrees per second at optimal speed
+		optimalTurnSpeed: 250, // speed where turning is best
+		minSpeed: 100,
+		maxSpeed: 500,
+	},
+	'A10': {
+		scale: 10,
+		maxBankAngle: 60,
+		maxTurnRate: 60,
+		optimalTurnSpeed: 250,
+		minSpeed: 80,
+		maxSpeed: 400,
+	}
+};
 
 const room = {
 	freeforall: new Map()
 }
+
+const app = express();
+expressWs(app);
 
 function getRandomItem(array) {
 	return array[Math.floor(Math.random() * array.length)];
@@ -42,12 +61,58 @@ function sanitizeCallsign(callsign) {
 	return sanitized.length > 0 ? sanitized : null;
 }
 
+function angleDifference(target, current) {
+	let diff = target - current;
+	while (diff > 180) diff -= 360;
+	while (diff < -180) diff += 360;
+	return diff;
+}
+
+function calculateTurnRate(speed, config) {
+	const { maxTurnRate, optimalTurnSpeed, minSpeed, maxSpeed } = config;
+	const speedDiff = Math.abs(speed - optimalTurnSpeed);
+	const maxDiff = Math.max(optimalTurnSpeed - minSpeed, maxSpeed - optimalTurnSpeed);
+	const efficiency = 1 - (speedDiff / maxDiff) * 0.6;
+	return maxTurnRate * efficiency;
+}
+
+function updatePlayerPhysics(player, deltaTime) {
+	const config = JET_CONFIG[player.jet];
+
+	// Calculate angle to mouse cursor
+	const dx = player.mousePos.worldX - player.pos.x;
+	const dz = player.mousePos.worldZ - player.pos.z;
+	const targetHeading = Math.atan2(dx, dz) * (180 / Math.PI);
+
+	// Calculate turn
+	const headingDiff = angleDifference(targetHeading, player.heading);
+	const currentTurnRate = calculateTurnRate(player.speed, config);
+	const turnAmount = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), currentTurnRate * deltaTime);
+
+	player.heading += turnAmount;
+
+	// Normalize heading
+	while (player.heading >= 360) player.heading -= 360;
+	while (player.heading < 0) player.heading += 360;
+
+	// Update position
+	const headingRad = player.heading * (Math.PI / 180);
+	const velocityX = Math.sin(headingRad) * player.speed * deltaTime;
+	const velocityZ = Math.cos(headingRad) * player.speed * deltaTime;
+
+	player.pos.x += velocityX;
+	player.pos.z += velocityZ;
+
+	// Calculate bank angle
+	const targetBankAngle = (turnAmount / (currentTurnRate * deltaTime)) * config.maxBankAngle;
+	const bankSmoothness = 5;
+	player.bankAngle += (targetBankAngle - player.bankAngle) * Math.min(deltaTime * bankSmoothness, 1);
+}
+
 app.ws('/game/freeforall', (ws, req) => {
-	const token = req.query.token;
+	const token = req.query.token; //token user is given to join the game
 
-	// Server keeps these constants
-	const WORLD_SIZE = 30000;
-
+	//missing token handler
 	if (!token) {
 		ws.close(4401, 'Missing token');
 		return;
@@ -61,6 +126,36 @@ app.ws('/game/freeforall', (ws, req) => {
 		return;
 	}
 
+	// Server keeps these constants
+	const WORLD_SIZE = 30000;
+	const players = room.freeforall;
+
+	let playerID; // or crypto.randomBytes(16).toString('hex')
+	do {
+		playerID = crypto.randomUUID();
+	} while (players.has(playerID));
+
+	players.set(playerID, {
+		connection: ws,
+		ready: false,
+		callsign: playerData.callsign,
+		jet: playerData.jet,
+		pos: {
+			x: 0,
+			z: 0
+		},
+		mousePos: {
+			worldX: 0,
+			worldZ: 0
+		},
+		speed: 100,
+		heading: 0,
+		bankAngle: 0,
+		lastUpdate: Date.now()
+	});
+
+	const player = players.get(playerID);
+
 	ws.send(JSON.stringify({
 		type: 'session:init',
 		callsign: playerData.callsign,
@@ -68,13 +163,44 @@ app.ws('/game/freeforall', (ws, req) => {
 		jet: playerData.jet,
 		pos: {
 			x: 0,
-			y: 0
+			z: 0
 		},
 		worldSize: WORLD_SIZE,
 	}));
 
 	ws.on('message', (message) => {
+		let data;
 
+		try {
+			data = JSON.parse(message);
+
+		} catch (error) {
+			console.error('Error parsing message:', error);
+			return;
+		}
+
+		if (data.type === 'session:ready') {
+			console.log('player connected');
+			player.ready = true;
+			player.lastUpdate = Date.now();
+
+			player.connection.send(JSON.stringify({
+				type: 'position:update',
+				pos: { x: player.pos.x, z: player.pos.z },
+				heading: player.heading,
+				bankAngle: player.bankAngle
+			}));
+		}
+
+		if (data.type === 'mouse:update') {
+			player.mousePos.worldX = data.mouse.worldX;
+			player.mousePos.worldZ = data.mouse.worldZ;
+		}
+	});
+
+	ws.on('close', () => {
+		players.delete(playerID);
+		console.log('player disconnected');
 	});
 });
 
@@ -143,3 +269,36 @@ app.get('*', (req, res) => {
 app.listen(PORT, () => {
 	console.log(`Server on port ${PORT}`);
 });
+
+setInterval(() => {
+	const players = room.freeforall;
+	const now = Date.now();
+
+	players.forEach(player => {
+		if (!player.ready) return;
+
+		console.log(player)
+
+		// Calculate delta time
+		const deltaTime = (now - player.lastUpdate) / 1000;
+		player.lastUpdate = now;
+
+		console.log('hey');
+
+		// Update physics server-side
+		updatePlayerPhysics(player, deltaTime);
+
+		// Send position correction to client
+		if (player.connection.readyState === 1) { // WebSocket.OPEN
+			player.connection.send(JSON.stringify({
+				type: 'position:update',
+				pos: {
+					x: player.pos.x,
+					z: player.pos.z
+				},
+				heading: player.heading,
+				bankAngle: player.bankAngle
+			}));
+		}
+	});
+}, 16);

@@ -1,7 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 
-// jetConfig.js
 const JET_CONFIG = {
 	'F22': {
 		scale: 10,
@@ -22,13 +21,15 @@ const JET_CONFIG = {
 };
 
 const mouse = { x: 0, y: 0, worldX: 0, worldZ: 0 };
-
 const flightState = {
+	ready: false,
 	heading: 0, // current heading in degrees (0 = south)
-	speed: 250, // current speed
+	speed: 100, // current speed
 	position: { x: 0, z: 0 },
-	bankAngle: 0
-};
+	bankAngle: 0,
+	testX: 0,
+	testZ: 0
+}
 
 let menuActive = true;
 const VIEW_HEIGHT = 1000;
@@ -77,10 +78,35 @@ function connectToGame(token, gamemode) {
 	ws.onmessage = (event) => {
 		const data = JSON.parse(event.data);
 
-		if (data.type == 'session:init') {
-			startClientGame(data);
+		//server starts the session and gives player info
+		if (data.type === 'session:init') {
+			startClientGame(data, ws); //start the game using player info
+			//after everything is loaded tell server we are ready
+			ws.send(JSON.stringify({
+				type: 'session:ready',
+				state: flightState
+			}));
 		}
-	};
+
+		if (data.type === 'position:update') {
+			//console.log(`${flightState.position.x}/${data.pos.x}`);
+			if (!flightState.ready) {
+				flightState.ready = true;
+			}
+			flightState.testX = data.pos.x;
+			flightState.testZ = data.pos.z;
+
+			if((flightState.position.x-flightState.testX)*(-1) > 25){
+				flightState.position.x = flightState.testX;
+			}
+
+			if((flightState.position.z-flightState.testZ)*(-1) > 25){
+				flightState.position.z = flightState.testZ;
+			}
+			//flightState.position.x = data.pos.x;
+			//flightState.position.z = data.pos.z;
+		}
+	}
 
 	ws.onerror = (error) => {
 		console.error('WebSocket error:', error);
@@ -91,7 +117,7 @@ function connectToGame(token, gamemode) {
 	};
 }
 
-function startClientGame(session) {
+function startClientGame(session, ws) {
 	menuActive = false;
 
 	const canvas = setupCanvas();
@@ -107,12 +133,11 @@ function startClientGame(session) {
 	setupWorld(scene, session);
 	loadPlayerJet(scene, session.jet);
 
-
 	const directionArrow = createDirectionArrow(scene);
 
 	setupResizeHandler(camera, renderer, VIEW_HEIGHT);
 
-	startRenderLoop(renderer, scene, camera, directionArrow, session.jet);
+	startRenderLoop(renderer, scene, camera, directionArrow, session.jet, ws);
 }
 
 //calculates the shortest rotation between two angles (handles the wraparound from 359° to 0°
@@ -336,35 +361,84 @@ function setupResizeHandler(camera, renderer, viewHeight) {
 
 //Update mouse world coordinates based on current camera position
 //mouse position needs to based off world coordinates for use in game
-function updateMouseWorldPosition(camera) {
+let lastMouseSendTime = 0; //used to decide whether to send mouse position update to the server
+function updateMouseWorldPosition(camera, ws) {
 	const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
 	vector.unproject(camera);
 	mouse.worldX = vector.x;
 	mouse.worldZ = vector.z;
+
+	const now = performance.now();
+	//60 Hz cap
+	if ((now - lastMouseSendTime) >= (1000 / 60)) {
+		ws.send(JSON.stringify({
+			type: 'mouse:update',
+			mouse: {
+				worldX: mouse.worldX,
+				worldZ: mouse.worldZ
+			}
+		}));
+		lastMouseSendTime = now;
+	}
 }
 
-function startRenderLoop(renderer, scene, camera, directionArrow, jetModelName) {
+function startRenderLoop(renderer, scene, camera, directionArrow, jetModelName, ws) {
 	const config = JET_CONFIG[jetModelName];
 	let lastTime = 0;
 
+	const circle = createCircle(scene, 25);
+
 	function animate(currentTime) {
 		requestAnimationFrame(animate);
+
+		if (!flightState.ready) return;
+
 		const jet = window.playerJet;
 		if (!jet) return;
 
 		const deltaTime = (currentTime - lastTime) / 1000;
 		lastTime = currentTime;
 
-		//jet.rotation.z = radians;
-
 		updateCamera(camera, jet);
-		updateMouseWorldPosition(camera);
+		updateMouseWorldPosition(camera, ws);
 		updateJetPhysics(jet, config, deltaTime);
 		updateDirectionArrow(directionArrow, jet, mouse.worldX, mouse.worldZ);
+
+		circle.position.x = flightState.testX;
+		circle.position.z = flightState.testZ;
 
 		renderer.render(scene, camera);
 	}
 	animate(0);
+}
+
+function createCircle(scene, radius, color = 0xff0000, segments = 64) {
+	// Create circle geometry
+	const geometry = new THREE.RingGeometry(
+		radius - 2,  // inner radius (slightly smaller to create a ring/outline)
+		radius,      // outer radius
+		segments     // number of segments (higher = smoother circle)
+	);
+
+	// Create material
+	const material = new THREE.MeshBasicMaterial({
+		color: color,
+		side: THREE.DoubleSide,
+		transparent: true,
+		opacity: 0.5
+	});
+
+	// Create mesh
+	const circle = new THREE.Mesh(geometry, material);
+
+	// Rotate to lay flat on the ground (XZ plane)
+	circle.rotation.x = -Math.PI / 2;
+	circle.position.y = 0.5; // Slightly above ground to avoid z-fighting
+
+	// Add to scene
+	scene.add(circle);
+
+	return circle;
 }
 
 function loadPlayerJet(scene, jetModel) {

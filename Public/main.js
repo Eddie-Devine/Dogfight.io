@@ -1,5 +1,6 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
 
 const JET_CONFIG = {
 	'F22': {
@@ -22,8 +23,7 @@ const JET_CONFIG = {
 
 const mouse = { x: 0, y: 0, worldX: 0, worldZ: 0 };
 const flightState = {
-	ready: false,
-	heading: 0, // current heading in degrees (0 = south)
+	heading: 180, // current heading in degrees (0 = south)
 	speed: 100, // current speed
 	position: { x: 0, z: 0 },
 	bankAngle: 0,
@@ -33,6 +33,12 @@ const flightState = {
 
 let menuActive = true;
 const VIEW_HEIGHT = 1000;
+
+let scene = null;
+const remotePlayers = new Map();
+const pendingRemoteSpawns = new Set();
+const jetTemplateCache = new Map();
+const gltfLoader = new GLTFLoader();
 
 async function initGuest() {
 	try {
@@ -80,32 +86,69 @@ function connectToGame(token, gamemode) {
 
 		//server starts the session and gives player info
 		if (data.type === 'session:init') {
+			flightState.position.x = data.pos.x;
+			flightState.position.z = data.pos.z;
+
 			startClientGame(data, ws); //start the game using player info
 			//after everything is loaded tell server we are ready
-			ws.send(JSON.stringify({
-				type: 'session:ready',
-				state: flightState
-			}));
 		}
 
+		//server sends its copy of the players physics
 		if (data.type === 'position:update') {
-			//console.log(`${flightState.position.x}/${data.pos.x}`);
-			if (!flightState.ready) {
-				flightState.ready = true;
-			}
 			flightState.testX = data.pos.x;
 			flightState.testZ = data.pos.z;
 
-			if((flightState.position.x-flightState.testX)*(-1) > 25){
-				flightState.position.x = flightState.testX;
+			//check how far off client is from server
+			const dx = data.pos.x - flightState.position.x;
+			const dz = data.pos.z - flightState.position.z;
+			const error = Math.hypot(dx, dz);
+
+			if (error > 120) {
+				// large error: snap
+				flightState.position.x = data.pos.x;
+				flightState.position.z = data.pos.z;
+			} else {
+				// small error: smooth correction
+				const blend = 0.15;
+				flightState.position.x += dx * blend;
+				flightState.position.z += dz * blend;
+			}
+		}
+
+		//server sends list of remote players the client needs to know and display
+		if (data.type === 'world:update') {
+			if (!scene) return;
+
+			//players the server sent
+			const seen = new Set();
+
+			for (const p of data.players) {
+				seen.add(p.ID); // or p.id, match your server field
+
+				//load new player if they weren't in last snapshot
+				let remote = remotePlayers.get(p.ID);
+				if (!remote) {
+					spawnRemoteJet(p);
+					continue;
+				}
+
+				//update their physics based on snapshot
+				remote.position.x = p.pos.x;
+				remote.position.z = p.pos.z;
+				remote.rotation.y = (p.heading * Math.PI / 180) + Math.PI;
+				remote.rotation.z = p.bankAngle * Math.PI / 180;
 			}
 
-			if((flightState.position.z-flightState.testZ)*(-1) > 25){
-				flightState.position.z = flightState.testZ;
+			//remove players from last snapshot that arnt in this snapshot
+			for (const [id, obj] of remotePlayers) {
+				if (!seen.has(id)) {
+					scene.remove(obj);
+					remotePlayers.delete(id);
+					pendingRemoteSpawns.delete(id);
+				}
 			}
-			//flightState.position.x = data.pos.x;
-			//flightState.position.z = data.pos.z;
 		}
+
 	}
 
 	ws.onerror = (error) => {
@@ -115,6 +158,50 @@ function connectToGame(token, gamemode) {
 	ws.onclose = () => {
 		console.log('Disconnected from game');
 	};
+}
+
+async function getJetTemplate(jetModel) {
+	const cached = jetTemplateCache.get(jetModel);
+	if (cached) return cached;
+
+	const loadPromise = new Promise((resolve, reject) => {
+		gltfLoader.load(
+			`/Models/${jetModel}/scene.gltf`,
+			(gltf) => resolve(gltf.scene),
+			undefined,
+			(error) => reject(error)
+		);
+	});
+
+	jetTemplateCache.set(jetModel, loadPromise);
+	return loadPromise;
+}
+
+async function spawnRemoteJet(playerState) {
+	const playerId = playerState.ID;
+	if (!playerId) return;
+	if (remotePlayers.has(playerId)) return; //don't spawn duplicate
+	if (pendingRemoteSpawns.has(playerId)) return; //don't spawn if in process of spawining already
+
+	pendingRemoteSpawns.add(playerId);
+	try {
+		const template = await getJetTemplate(playerState.jet);
+		if (!scene) return;
+
+		const remoteJet = cloneSkeleton(template);
+		const config = JET_CONFIG[playerState.jet] || JET_CONFIG.F22;
+		remoteJet.scale.set(config.scale, config.scale, config.scale);
+		remoteJet.position.set(playerState.pos.x, 0, playerState.pos.z);
+		remoteJet.rotation.y = (playerState.heading * Math.PI / 180) + Math.PI;
+		remoteJet.rotation.z = playerState.bankAngle * Math.PI / 180;
+
+		scene.add(remoteJet);
+		remotePlayers.set(playerId, remoteJet);
+	} catch (error) {
+		console.error('Error spawning remote jet:', error);
+	} finally {
+		pendingRemoteSpawns.delete(playerId);
+	}
 }
 
 function startClientGame(session, ws) {
@@ -127,17 +214,17 @@ function startClientGame(session, ws) {
 	renderer.setSize(window.innerWidth, window.innerHeight);
 	renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
 
-	const scene = new THREE.Scene();
+	scene = new THREE.Scene();
 	const camera = setupCamera();
 
-	setupWorld(scene, session);
-	loadPlayerJet(scene, session.jet);
+	setupWorld(session);
+	loadPlayerJet(session.jet, ws);
 
-	const directionArrow = createDirectionArrow(scene);
+	const directionArrow = createDirectionArrow();
 
 	setupResizeHandler(camera, renderer, VIEW_HEIGHT);
 
-	startRenderLoop(renderer, scene, camera, directionArrow, session.jet, ws);
+	startRenderLoop(renderer, camera, directionArrow, session.jet, ws);
 }
 
 //calculates the shortest rotation between two angles (handles the wraparound from 359° to 0°
@@ -211,7 +298,7 @@ function updateJetPhysics(jet, config, deltaTime) {
 	jet.rotation.z = flightState.bankAngle * (Math.PI / 180);
 }
 
-function createDirectionArrow(scene) {
+function createDirectionArrow() {
 	// Create a small triangle that points upward (towards +Z in world space)
 	const shape = new THREE.Shape();
 	const size = 15; // Size of the arrow
@@ -285,7 +372,7 @@ function hideMenu() {
 	if (brand) brand.classList.add('hidden');
 }
 
-function setupWorld(scene, session) {
+function setupWorld(session) {
 	const gridSize = session.worldSize;
 	const divisions = gridSize / 50; //each box is x world units
 
@@ -371,6 +458,8 @@ function updateMouseWorldPosition(camera, ws) {
 	const now = performance.now();
 	//60 Hz cap
 	if ((now - lastMouseSendTime) >= (1000 / 60)) {
+		if (ws.readyState !== WebSocket.OPEN) return; //dont send update if socket closes
+
 		ws.send(JSON.stringify({
 			type: 'mouse:update',
 			mouse: {
@@ -382,22 +471,27 @@ function updateMouseWorldPosition(camera, ws) {
 	}
 }
 
-function startRenderLoop(renderer, scene, camera, directionArrow, jetModelName, ws) {
+function startRenderLoop(renderer, camera, directionArrow, jetModelName, ws) {
 	const config = JET_CONFIG[jetModelName];
-	let lastTime = 0;
+	let lastTime = null;
 
-	const circle = createCircle(scene, 25);
+	const circle = createCircle(25);
 
 	function animate(currentTime) {
 		requestAnimationFrame(animate);
 
-		if (!flightState.ready) return;
-
 		const jet = window.playerJet;
-		if (!jet) return;
+		if (!jet) {
+			lastTime = currentTime; //keep clock synced while waiting for model to load
+			return;
+		}
 
-		const deltaTime = (currentTime - lastTime) / 1000;
+		if (lastTime === null) lastTime = currentTime; //set last time is jet loads really fast (safty)
+
+		let deltaTime = (currentTime - lastTime) / 1000;
 		lastTime = currentTime;
+
+		deltaTime = Math.min(deltaTime, 1 / 30); //safty to prevent deltaTime from being huge from lag
 
 		updateCamera(camera, jet);
 		updateMouseWorldPosition(camera, ws);
@@ -412,7 +506,7 @@ function startRenderLoop(renderer, scene, camera, directionArrow, jetModelName, 
 	animate(0);
 }
 
-function createCircle(scene, radius, color = 0xff0000, segments = 64) {
+function createCircle(radius, color = 0xff0000, segments = 64) {
 	// Create circle geometry
 	const geometry = new THREE.RingGeometry(
 		radius - 2,  // inner radius (slightly smaller to create a ring/outline)
@@ -441,10 +535,8 @@ function createCircle(scene, radius, color = 0xff0000, segments = 64) {
 	return circle;
 }
 
-function loadPlayerJet(scene, jetModel) {
-	const loader = new GLTFLoader();
-
-	loader.load(`/Models/${jetModel}/scene.gltf`, (gltf) => {
+function loadPlayerJet(jetModel, ws) {
+	gltfLoader.load(`/Models/${jetModel}/scene.gltf`, (gltf) => {
 		const jet = gltf.scene;
 		const config = JET_CONFIG[jetModel];
 
@@ -453,6 +545,15 @@ function loadPlayerJet(scene, jetModel) {
 		scene.add(jet);
 
 		window.playerJet = jet;
+
+
+		if (ws.readyState === WebSocket.OPEN) {
+			ws.send(JSON.stringify({
+				type: 'session:ready',
+				state: flightState
+			}));
+		}
+
 	}, undefined, (error) => {
 		console.error('Error loading jet model:', error);
 	});

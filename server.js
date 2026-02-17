@@ -137,7 +137,7 @@ app.ws('/game/freeforall', (ws, req) => {
 
 	players.set(playerID, {
 		connection: ws,
-		ready: false,
+		isReady: false,
 		callsign: playerData.callsign,
 		jet: playerData.jet,
 		pos: {
@@ -148,8 +148,8 @@ app.ws('/game/freeforall', (ws, req) => {
 			worldX: 0,
 			worldZ: 0
 		},
-		speed: 100,
-		heading: 0,
+		speed: 50,
+		heading: 180,
 		bankAngle: 0,
 		lastUpdate: Date.now()
 	});
@@ -159,6 +159,7 @@ app.ws('/game/freeforall', (ws, req) => {
 	ws.send(JSON.stringify({
 		type: 'session:init',
 		callsign: playerData.callsign,
+		playerID,
 		gamemode: playerData.gamemode,
 		jet: playerData.jet,
 		pos: {
@@ -180,9 +181,12 @@ app.ws('/game/freeforall', (ws, req) => {
 		}
 
 		if (data.type === 'session:ready') {
+			if (player.isReady) return;
+
 			console.log('player connected');
-			player.ready = true;
 			player.lastUpdate = Date.now();
+
+			player.isReady = true;
 
 			player.connection.send(JSON.stringify({
 				type: 'position:update',
@@ -193,8 +197,15 @@ app.ws('/game/freeforall', (ws, req) => {
 		}
 
 		if (data.type === 'mouse:update') {
-			player.mousePos.worldX = data.mouse.worldX;
-			player.mousePos.worldZ = data.mouse.worldZ;
+			if (!player.isReady) return; //wait for player to load before accepting movement
+
+			const x = data?.mouse?.worldX;
+			const z = data?.mouse?.worldZ;
+
+			if (!Number.isFinite(x) || !Number.isFinite(z)) return; //prevent bad data from crashing server
+
+			player.mousePos.worldX = x;
+			player.mousePos.worldZ = z;
 		}
 	});
 
@@ -272,24 +283,26 @@ app.listen(PORT, () => {
 
 setInterval(() => {
 	const players = room.freeforall;
+	const allPlayersState = [];
+
 	const now = Date.now();
 
-	players.forEach(player => {
-		if (!player.ready) return;
-
-		console.log(player)
+	//update each players physics and then add them to snapshot to broadcast to other players
+	players.forEach((player, ID) => {
+		if (!player.isReady) return;
 
 		// Calculate delta time
-		const deltaTime = (now - player.lastUpdate) / 1000;
+		let deltaTime = (now - player.lastUpdate) / 1000;
 		player.lastUpdate = now;
 
-		console.log('hey');
+		deltaTime = Math.min(deltaTime, 1 / 30); //safty so lag does not cause huge delta spike
 
 		// Update physics server-side
 		updatePlayerPhysics(player, deltaTime);
 
 		// Send position correction to client
 		if (player.connection.readyState === 1) { // WebSocket.OPEN
+			//send position update to client
 			player.connection.send(JSON.stringify({
 				type: 'position:update',
 				pos: {
@@ -299,6 +312,31 @@ setInterval(() => {
 				heading: player.heading,
 				bankAngle: player.bankAngle
 			}));
+
+			//add updated player to snapshot
+			allPlayersState.push({
+				ID,
+				callsign: player.callsign,
+				jet: player.jet,
+				pos: { x: player.pos.x, z: player.pos.z },
+				heading: player.heading,
+				bankAngle: player.bankAngle
+			});
 		}
 	});
+
+	//broadcast to each player world snapshot
+	players.forEach( (recipient, recipientID) => {
+		if (!recipient.isReady) return;
+		if (recipient.connection.readyState !== 1) return;
+
+		//exclude the recipeint from the snapshot
+		const others = allPlayersState.filter(player => player.ID !== recipientID);
+
+		recipient.connection.send(JSON.stringify({
+			type: 'world:update',
+			players: others
+		}));
+	});
+
 }, 16);

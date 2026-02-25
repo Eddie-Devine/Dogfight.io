@@ -104,20 +104,21 @@ function connectToGame(token, gamemode) {
 			//after everything is loaded tell server we are ready
 		}
 
-		if (data.type === 'position:update') {
-			flightState.testX = data.position.x;
-			flightState.testZ = data.position.z;
+		if (data.type === 'world:update') {
+			flightState.testX = data?.self?.position?.x;
+			flightState.testZ = data?.self?.position?.z;
 
 			//check how far off client is from server
-			const dx = data.position.x - flightState.position.x;
-			const dz = data.position.z - flightState.position.z;
+			const dx = data.self.position.x - flightState.position.x;
+			const dz = data.self.position.z - flightState.position.z;
 			const error = Math.hypot(dx, dz);
 
+			//correct error
 			if (error > 120) {
 				// large error: snap
 				console.log("snap");
-				flightState.position.x = data.position.x;
-				flightState.position.z = data.position.z;
+				flightState.position.x = data.self.position.x;
+				flightState.position.z = data.self.position.z;
 			}
 			else {
 				// small error: smooth correction
@@ -126,20 +127,19 @@ function connectToGame(token, gamemode) {
 				flightState.position.x += dx * blend;
 				flightState.position.z += dz * blend;
 			}
-		}
 
-		//server sends list of remote players the client needs to know and display
-		if (data.type === 'players:update') {
 			if (!scene) return;
 
 			//players the server sent
 			const seen = new Set();
 
-			for (const p of data.players) {
-				seen.add(p.ID); // or p.id, match your server field
+			//console.log(data.visualContacts);
+
+			for (const p of data.visualContacts) {
+				seen.add(p.id); // or p.id, match your server field
 
 				//load new player if they weren't in last snapshot
-				let remote = remotePlayers.get(p.ID);
+				let remote = remotePlayers.get(p.id);
 				if (!remote) {
 					spawnRemoteJet(p);
 					continue;
@@ -162,10 +162,10 @@ function connectToGame(token, gamemode) {
 			}
 		}
 
-		if(data.type === 'radar:update'){
+		if (data.type === 'radar:update') {
 			const radarContacts = data.radarContacts;
 			updateRadar(radarContacts);
-			console.log(radarContacts);
+			//console.log(radarContacts);
 		}
 
 	}
@@ -198,7 +198,8 @@ async function getJetTemplate(jetModel) {
 }
 
 async function spawnRemoteJet(playerState) {
-	const playerId = playerState.ID;
+	console.log(playerState.id);
+	const playerId = playerState.id;
 	if (!playerId) return;
 	if (remotePlayers.has(playerId)) return; //don't spawn duplicate
 	if (pendingRemoteSpawns.has(playerId)) return; //don't spawn if in process of spawining already
@@ -228,39 +229,39 @@ const RADAR_CENTER = 100;   // SVG center
 const RADAR_RADIUS = 86;    // SVG radar ring radius
 const WORLD_RADIUS = 8000;  // how many world units the radar edge represents
 function updateRadar(contacts) {
-    const blipGroup = document.getElementById('radar-blips');
-    if (!blipGroup) return;
+	const blipGroup = document.getElementById('radar-blips');
+	if (!blipGroup) return;
 
-    blipGroup.innerHTML = '';
+	blipGroup.innerHTML = '';
 
-    for (const [x, z] of contacts) {
-        const dx = x - flightState.position.x;
-        const dz = z - flightState.position.z;
+	for (const [x, z] of contacts) {
+		const dx = x - flightState.position.x;
+		const dz = z - flightState.position.z;
 
-        if (Math.hypot(dx, dz) > WORLD_RADIUS) continue;
+		if (Math.hypot(dx, dz) > WORLD_RADIUS) continue;
 
-        const scale = RADAR_RADIUS / WORLD_RADIUS;
-        const svgX = RADAR_CENTER + dx * scale;
-        const svgZ = RADAR_CENTER + dz * scale;
+		const scale = RADAR_RADIUS / WORLD_RADIUS;
+		const svgX = RADAR_CENTER + dx * scale;
+		const svgZ = RADAR_CENTER + dz * scale;
 
-        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+		const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
 
-        const outer = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        outer.setAttribute('cx', svgX);
-        outer.setAttribute('cy', svgZ);
-        outer.setAttribute('r', '2.5');
-        outer.setAttribute('fill', '#4de3ff');
+		const outer = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+		outer.setAttribute('cx', svgX);
+		outer.setAttribute('cy', svgZ);
+		outer.setAttribute('r', '2.5');
+		outer.setAttribute('fill', '#4de3ff');
 
-        const inner = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
-        inner.setAttribute('cx', svgX);
-        inner.setAttribute('cy', svgZ);
-        inner.setAttribute('r', '1');
-        inner.setAttribute('fill', '#ffffff');
+		const inner = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+		inner.setAttribute('cx', svgX);
+		inner.setAttribute('cy', svgZ);
+		inner.setAttribute('r', '1');
+		inner.setAttribute('fill', '#ffffff');
 
-        g.appendChild(outer);
-        g.appendChild(inner);
-        blipGroup.appendChild(g);
-    }
+		g.appendChild(outer);
+		g.appendChild(inner);
+		blipGroup.appendChild(g);
+	}
 }
 
 //creates envirment for game
@@ -527,7 +528,7 @@ function sendInputUpdate(ws) {
 }
 
 let lastRadarRequestTime = 0;
-function requestRadarUpdate(ws){
+function requestRadarUpdate(ws) {
 	if (ws.readyState !== WebSocket.OPEN) return;
 
 	const now = performance.now();

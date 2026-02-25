@@ -3,26 +3,36 @@ const expressWs = require('express-ws');
 const path = require('path');
 const JWT = require('jsonwebtoken');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const updatePlayerPhysics = require('./serverPhysics.js');
 const JET_CONFIG = require('./jetConfig.json');
+
+//load default callsigns from txt
+let DEFAULT_CALLSIGNS = ['ERROR: NO DEFAULT CALLSIGNS'];
+try {
+    const data = fs.readFileSync('defaultCallsigns.txt', 'utf-8');
+    DEFAULT_CALLSIGNS = data.split(/\r?\n/);
+} catch (error) {
+    console.log(error);
+}
 
 //TEMPERARY: replacement for ENV variables
 const PORT = 3000;
 const JWT_SECRET = 'DEV_ONLY_CHANGE_ME';
 
 const VALID_GAMEMODES = ['freeforall'];
+const VIEW_DISTANCE = 3000; //max viewing distance for visual contacts
+const VIEW_DISTANCE_SQ = VIEW_DISTANCE * VIEW_DISTANCE; //calculated here to avoid re-running arithmic in the loop
 const FREE_JETS = ['F22', 'A10']; //jets that don't need extra validation to play
-const DEFAULT_CALLSIGNS = [ //callsigns given if player does not choose name
-	'Maverick', 'Iceman', 'Goose', 'Viper', 'Jester',
-	'Cougar', 'Merlin', 'Sundown', 'Chipper', 'Hollywood'
-];
 
-const room = { //Each game room for different game modes
+//Each game room for different game modes
+const room = {
 	freeforall: {
 		worldSize: 30000,
 		stormSize: 20000,
-		players: new Map()
+		players: new Map(),
+		spacialMap: new Map()
 	}
 }
 
@@ -51,12 +61,20 @@ function sanitizeCallsign(callsign) {
 	return sanitized.length > 0 ? sanitized : null;
 }
 
-function randomCordinates(boundry) {
+function getRandomcordinates(boundry) {
 	//boundry is cut in half because (0,0) is center for client but on server it is the top left
 	const half = boundry / 2;
 	const x = Math.floor(Math.random() * (boundry - half));
 	const z = Math.floor(Math.random() * (boundry - half));
 	return { x, z };
+}
+
+function getChunkCoordinates(x, z) {
+	const CHUNK_SIZE = VIEW_DISTANCE;
+	return {
+		chunkX: Math.floor(x / CHUNK_SIZE),
+		chunkZ: Math.floor(z / CHUNK_SIZE)
+	};
 }
 
 app.ws('/game/freeforall', (ws, req) => {
@@ -96,7 +114,9 @@ app.ws('/game/freeforall', (ws, req) => {
 		jet: playerData.jet,
 		position: {
 			x: playerX,
-			z: playerZ
+			z: playerZ,
+			chunkX: null,
+			chunkZ: null
 		},
 		input: {
 			aimAngle: 0,
@@ -285,33 +305,88 @@ app.listen(PORT, () => {
 	console.log(`Server on port ${PORT}`);
 });
 
+
+//free for all game tick
 setInterval(() => {
-
-	const players = room.freeforall.players;
-	const allPlayersState = [];
-
+	const players = room.freeforall.players; //map of all player states
 	const now = Date.now();
 
-	//update each players physics and then add them to snapshot to broadcast to other players
-	players.forEach((player, ID) => {
+	//Update physics
+	players.forEach(player => {
 		if (!player.isReady) return;
 
-		// Calculate delta time
 		let deltaTime = (now - player.lastUpdate) / 1000;
-		player.lastUpdate = now;
+		deltaTime = Math.min(deltaTime, 300); //cap deltaTime
 
-		deltaTime = Math.min(deltaTime, 1 / 60); //safty so lag does not cause huge delta spike
-
-		// Update physics server-side
 		const config = JET_CONFIG[player.jet];
 		updatePlayerPhysics(player, config, deltaTime);
+		player.lastUpdate = now;
 
-		// Send position correction to client
-		if (player.connection.readyState === 1) { // WebSocket.OPEN
-			//send position update to client
-			player.connection.send(JSON.stringify({
-				type: 'position:update',
-				seq: player.input.seq,
+		//cache chunk to avoid recomuting
+		const { chunkX, chunkZ } = getChunkCoordinates(player.position.x, player.position.z);
+        player.position.chunkX = chunkX;
+		player.position.chunkZ = chunkZ;
+	});
+
+	//build spacial map
+	const spatialMap = room.freeforall.spacialMap;
+	spatialMap.clear();
+    players.forEach((player, id) => {
+        const key = `${player.position.chunkX},${player.position.chunkZ}`;
+        let chunk = spatialMap.get(key);
+        if (!chunk) {
+            chunk = [];
+            spatialMap.set(key, chunk);
+        }
+        chunk.push({ id, player });
+    });
+
+	// Send updates
+	players.forEach(player => {
+		if (!player.isReady) return;
+		if (player.connection.readyState !== 1) return;
+
+		const { chunkX, chunkZ } = player.position;
+		const nearbyPlayers = []; //visual contacts
+
+		//for loop and nested for loop check 3x3 grid of chunks (x,z)
+		for (let x = -1; x <= 1; x++) { //checks horizontally
+			for (let z = -1; z <= 1; z++) { //checks virtically
+				const key = `${chunkX + x},${chunkZ + z}`;
+				const chunk = spatialMap.get(key);
+				if (!chunk) continue;
+
+				//loop through players in chunk
+				for (const { id: remotePlayerId, player: remotePlayer } of chunk) {
+					if (remotePlayer === player) continue; //ignore the reciepent
+
+					//distance to remote player
+					const dx = remotePlayer.position.x - player.position.x;
+					const dz = remotePlayer.position.z - player.position.z;
+
+					//ignore players too far away to see
+					if ((dx * dx + dz * dz) > VIEW_DISTANCE_SQ) continue; 
+
+					//add santitized player object to send to client
+					nearbyPlayers.push({
+						id: remotePlayerId,
+						jet: remotePlayer.jet,
+						position: {
+							x: remotePlayer.position.x,
+							z: remotePlayer.position.z
+						},
+						heading: remotePlayer.heading,
+						bankAngle: remotePlayer.bankAngle,
+						speed: remotePlayer.speed
+					});
+				}
+			}
+		}
+
+		player.connection.send(JSON.stringify({
+			type: 'world:update',
+			seq: player.input.seq,
+			self: {
 				position: {
 					x: player.position.x,
 					z: player.position.z
@@ -319,37 +394,8 @@ setInterval(() => {
 				heading: player.heading,
 				bankAngle: player.bankAngle,
 				speed: player.speed
-			}));
-
-			//add updated player to snapshot
-			allPlayersState.push({
-				ID,
-				callsign: player.callsign,
-				jet: player.jet,
-				position: { x: player.position.x, z: player.position.z },
-				heading: player.heading,
-				bankAngle: player.bankAngle
-			});
-		}
-	});
-
-	//broadcast to each player world snapshot
-	players.forEach((recipient, recipientID) => {
-		if (!recipient.isReady) return;
-		if (recipient.connection.readyState !== 1) return;
-
-		//exclude the recipeint from the snapshot
-		let remotePlayers = allPlayersState.filter(player => player.ID !== recipientID);
-
-		//exclude players too far away to see (hardcoded distance)
-		remotePlayers = remotePlayers.filter(player => {
-			const distanceToPlayer = Math.hypot(recipient.position.x, recipient.position.z, player.position.x, player.position.z);
-			if (distanceToPlayer < 2000) return true;
-		});
-
-		recipient.connection.send(JSON.stringify({
-			type: 'players:update',
-			players: remotePlayers
+			},
+			visualContacts: nearbyPlayers
 		}));
 	});
 

@@ -1,0 +1,31 @@
+{
+	"F22": {
+		"scale": 10,
+		"maxBankAngle": 90,
+		"maxTurnRate": 100,
+		"bankSmoothness": 5,
+		"optimalTurnSpeed": 250,
+		"minSpeed": 0,
+		"maxSpeed": 1000,
+		"throttleGamma": 0.6,
+		"maxAccel": 220,
+		"maxDecel": 260,
+		"accelFalloffExp": 1.4,
+		"stealth": 0.5,
+		"radarDistance": 500,
+		"radarName": "AN/APG-77"
+	},
+	"A10": {
+		"scale": 10,
+		"maxBankAngle": 90,
+		"maxTurnRate": 100,
+		"bankSmoothness": 5,
+		"optimalTurnSpeed": 250,
+		"minSpeed": 100,
+		"maxSpeed": 1000,
+		"throttleGamma": 0.6,
+		"maxAccel": 220,
+		"maxDecel": 260,
+		"accelFalloffExp": 1.4
+	}
+}

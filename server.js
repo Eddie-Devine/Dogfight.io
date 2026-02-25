@@ -4,36 +4,26 @@ const path = require('path');
 const JWT = require('jsonwebtoken');
 const crypto = require('crypto');
 
+const updatePlayerPhysics = require('./serverPhysics.js');
+const JET_CONFIG = require('./jetConfig.json');
+
+//TEMPERARY: replacement for ENV variables
 const PORT = 3000;
 const JWT_SECRET = 'DEV_ONLY_CHANGE_ME';
 
 const VALID_GAMEMODES = ['freeforall'];
-const FREE_JETS = ['F22', 'A10'];
-const DEFAULT_CALLSIGNS = [
+const FREE_JETS = ['F22', 'A10']; //jets that don't need extra validation to play
+const DEFAULT_CALLSIGNS = [ //callsigns given if player does not choose name
 	'Maverick', 'Iceman', 'Goose', 'Viper', 'Jester',
 	'Cougar', 'Merlin', 'Sundown', 'Chipper', 'Hollywood'
 ];
-const JET_CONFIG = {
-	'F22': {
-		scale: 10,
-		maxBankAngle: 90,
-		maxTurnRate: 100, // degrees per second at optimal speed
-		optimalTurnSpeed: 250, // speed where turning is best
-		minSpeed: 100,
-		maxSpeed: 500,
-	},
-	'A10': {
-		scale: 10,
-		maxBankAngle: 60,
-		maxTurnRate: 60,
-		optimalTurnSpeed: 250,
-		minSpeed: 80,
-		maxSpeed: 400,
-	}
-};
 
-const room = {
-	freeforall: new Map()
+const room = { //Each game room for different game modes
+	freeforall: {
+		worldSize: 30000,
+		stormSize: 20000,
+		players: new Map()
+	}
 }
 
 const app = express();
@@ -61,52 +51,12 @@ function sanitizeCallsign(callsign) {
 	return sanitized.length > 0 ? sanitized : null;
 }
 
-function angleDifference(target, current) {
-	let diff = target - current;
-	while (diff > 180) diff -= 360;
-	while (diff < -180) diff += 360;
-	return diff;
-}
-
-function calculateTurnRate(speed, config) {
-	const { maxTurnRate, optimalTurnSpeed, minSpeed, maxSpeed } = config;
-	const speedDiff = Math.abs(speed - optimalTurnSpeed);
-	const maxDiff = Math.max(optimalTurnSpeed - minSpeed, maxSpeed - optimalTurnSpeed);
-	const efficiency = 1 - (speedDiff / maxDiff) * 0.6;
-	return maxTurnRate * efficiency;
-}
-
-function updatePlayerPhysics(player, deltaTime) {
-	const config = JET_CONFIG[player.jet];
-
-	// Calculate angle to mouse cursor
-	const dx = player.mousePos.worldX - player.pos.x;
-	const dz = player.mousePos.worldZ - player.pos.z;
-	const targetHeading = Math.atan2(dx, dz) * (180 / Math.PI);
-
-	// Calculate turn
-	const headingDiff = angleDifference(targetHeading, player.heading);
-	const currentTurnRate = calculateTurnRate(player.speed, config);
-	const turnAmount = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), currentTurnRate * deltaTime);
-
-	player.heading += turnAmount;
-
-	// Normalize heading
-	while (player.heading >= 360) player.heading -= 360;
-	while (player.heading < 0) player.heading += 360;
-
-	// Update position
-	const headingRad = player.heading * (Math.PI / 180);
-	const velocityX = Math.sin(headingRad) * player.speed * deltaTime;
-	const velocityZ = Math.cos(headingRad) * player.speed * deltaTime;
-
-	player.pos.x += velocityX;
-	player.pos.z += velocityZ;
-
-	// Calculate bank angle
-	const targetBankAngle = (turnAmount / (currentTurnRate * deltaTime)) * config.maxBankAngle;
-	const bankSmoothness = 5;
-	player.bankAngle += (targetBankAngle - player.bankAngle) * Math.min(deltaTime * bankSmoothness, 1);
+function randomCordinates(boundry) {
+	//boundry is cut in half because (0,0) is center for client but on server it is the top left
+	const half = boundry / 2;
+	const x = Math.floor(Math.random() * (boundry - half));
+	const z = Math.floor(Math.random() * (boundry - half));
+	return { x, z };
 }
 
 app.ws('/game/freeforall', (ws, req) => {
@@ -127,46 +77,67 @@ app.ws('/game/freeforall', (ws, req) => {
 	}
 
 	// Server keeps these constants
-	const WORLD_SIZE = 30000;
-	const players = room.freeforall;
+	const players = room.freeforall.players;
+	const WORLD_SIZE = room.freeforall.worldSize;
 
 	let playerID; // or crypto.randomBytes(16).toString('hex')
-	do {
+	do { //loop in case ID is taken
 		playerID = crypto.randomUUID();
 	} while (players.has(playerID));
+
+	//const { x: playerX, z: playerZ } = randomCordinates(WORLD_SIZE);
+	playerX = 0;
+	playerZ = 0;
 
 	players.set(playerID, {
 		connection: ws,
 		isReady: false,
 		callsign: playerData.callsign,
 		jet: playerData.jet,
-		pos: {
-			x: 0,
-			z: 0
+		position: {
+			x: playerX,
+			z: playerZ
 		},
-		mousePos: {
-			worldX: 0,
-			worldZ: 0
+		input: {
+			aimAngle: 0,
+			throttle: 0,
+			seq: 0,
+			lastInputAt: Date.now()
 		},
-		speed: 50,
-		heading: 180,
+		speed: JET_CONFIG[playerData.jet].minSpeed,
+		heading: 180, //degrees
 		bankAngle: 0,
 		lastUpdate: Date.now()
 	});
 
 	const player = players.get(playerID);
 
+	// ws.send(JSON.stringify({
+	// 	type: 'session:init',
+	// 	callsign: playerData.callsign,
+	// 	playerID,
+	// 	gamemode: playerData.gamemode,
+	// 	jet: playerData.jet,
+	// 	position: {
+	// 		x: playerX,
+	// 		z: playerZ
+	// 	},
+	// 	worldSize: WORLD_SIZE,
+	// }));
+
 	ws.send(JSON.stringify({
 		type: 'session:init',
 		callsign: playerData.callsign,
-		playerID,
-		gamemode: playerData.gamemode,
 		jet: playerData.jet,
-		pos: {
-			x: 0,
-			z: 0
+		position: {
+			x: playerX,
+			z: playerZ
 		},
+		speed: JET_CONFIG[playerData.jet].minSpeed,
+		heading: 180, //degrees
+		bankAngle: 0,
 		worldSize: WORLD_SIZE,
+		gamemode: playerData.gamemode,
 	}));
 
 	ws.on('message', (message) => {
@@ -183,35 +154,63 @@ app.ws('/game/freeforall', (ws, req) => {
 		if (data.type === 'session:ready') {
 			if (player.isReady) return;
 
-			console.log('player connected');
 			player.lastUpdate = Date.now();
 
 			player.isReady = true;
 
 			player.connection.send(JSON.stringify({
 				type: 'position:update',
-				pos: { x: player.pos.x, z: player.pos.z },
+				position: { x: player.position.x, z: player.position.z },
 				heading: player.heading,
 				bankAngle: player.bankAngle
 			}));
 		}
 
-		if (data.type === 'mouse:update') {
+		if (data.type === 'input:update') {
 			if (!player.isReady) return; //wait for player to load before accepting movement
 
-			const x = data?.mouse?.worldX;
-			const z = data?.mouse?.worldZ;
+			const aimAngle = data?.input?.aimAngle;
+			const throttle = data?.input?.throttle;
+			const seq = data?.seq;
 
-			if (!Number.isFinite(x) || !Number.isFinite(z)) return; //prevent bad data from crashing server
+			if (!Number.isFinite(aimAngle) || !Number.isFinite(throttle) || !Number.isFinite(seq)) return; //prevent bad data from crashing server
 
-			player.mousePos.worldX = x;
-			player.mousePos.worldZ = z;
+			const lastSeq = player.input.seq;
+			if (seq <= lastSeq) return; //drop duplicate/old packet
+
+			player.input.aimAngle = aimAngle;
+			player.input.throttle = Math.max(0, Math.min(1, throttle));
+			player.input.seq = seq;
+			player.input.lastInputAt = Date.now();
+		}
+
+		if (data.type === 'radar:request') {
+			if (!player.isReady) return;
+
+			const radarDistance = JET_CONFIG[player.jet].radarDistance;
+
+			const radarContacts = Array.from(players.entries())
+				.filter(([id]) => id !== playerID) //filter self from list
+				.map(([, remotePlayer]) => {
+					const dx = remotePlayer.position.x - player.position.x;
+					const dz = remotePlayer.position.z - player.position.z;
+					const distance = Math.hypot(dx, dz);
+
+					if (distance <= radarDistance) {
+						return [remotePlayer.position.x, remotePlayer.position.z];
+					}
+				})
+				.filter(Boolean); // remove undefined entries
+
+			player.connection.send(JSON.stringify({
+				type: 'radar:update',
+				radarContacts
+			}));
 		}
 	});
 
 	ws.on('close', () => {
 		players.delete(playerID);
-		console.log('player disconnected');
 	});
 });
 
@@ -269,7 +268,12 @@ app.post('/init/guest', (req, res) => {
 		{ expiresIn: '1h' }
 	);
 
-	res.json({ token, gamemode });
+	res.json({ token, gamemode, jet });
+});
+
+//TEMPERARY
+app.get('/jetConfig', (req, res) => {
+	res.send(JSON.stringify(JET_CONFIG));
 });
 
 //404 just sends users to main menu
@@ -282,7 +286,8 @@ app.listen(PORT, () => {
 });
 
 setInterval(() => {
-	const players = room.freeforall;
+
+	const players = room.freeforall.players;
 	const allPlayersState = [];
 
 	const now = Date.now();
@@ -295,22 +300,25 @@ setInterval(() => {
 		let deltaTime = (now - player.lastUpdate) / 1000;
 		player.lastUpdate = now;
 
-		deltaTime = Math.min(deltaTime, 1 / 30); //safty so lag does not cause huge delta spike
+		deltaTime = Math.min(deltaTime, 1 / 60); //safty so lag does not cause huge delta spike
 
 		// Update physics server-side
-		updatePlayerPhysics(player, deltaTime);
+		const config = JET_CONFIG[player.jet];
+		updatePlayerPhysics(player, config, deltaTime);
 
 		// Send position correction to client
 		if (player.connection.readyState === 1) { // WebSocket.OPEN
 			//send position update to client
 			player.connection.send(JSON.stringify({
 				type: 'position:update',
-				pos: {
-					x: player.pos.x,
-					z: player.pos.z
+				seq: player.input.seq,
+				position: {
+					x: player.position.x,
+					z: player.position.z
 				},
 				heading: player.heading,
-				bankAngle: player.bankAngle
+				bankAngle: player.bankAngle,
+				speed: player.speed
 			}));
 
 			//add updated player to snapshot
@@ -318,7 +326,7 @@ setInterval(() => {
 				ID,
 				callsign: player.callsign,
 				jet: player.jet,
-				pos: { x: player.pos.x, z: player.pos.z },
+				position: { x: player.position.x, z: player.position.z },
 				heading: player.heading,
 				bankAngle: player.bankAngle
 			});
@@ -326,16 +334,22 @@ setInterval(() => {
 	});
 
 	//broadcast to each player world snapshot
-	players.forEach( (recipient, recipientID) => {
+	players.forEach((recipient, recipientID) => {
 		if (!recipient.isReady) return;
 		if (recipient.connection.readyState !== 1) return;
 
 		//exclude the recipeint from the snapshot
-		const others = allPlayersState.filter(player => player.ID !== recipientID);
+		let remotePlayers = allPlayersState.filter(player => player.ID !== recipientID);
+
+		//exclude players too far away to see (hardcoded distance)
+		remotePlayers = remotePlayers.filter(player => {
+			const distanceToPlayer = Math.hypot(recipient.position.x, recipient.position.z, player.position.x, player.position.z);
+			if (distanceToPlayer < 2000) return true;
+		});
 
 		recipient.connection.send(JSON.stringify({
-			type: 'world:update',
-			players: others
+			type: 'players:update',
+			players: remotePlayers
 		}));
 	});
 

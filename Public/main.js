@@ -1,45 +1,51 @@
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { clone as cloneSkeleton } from 'three/addons/utils/SkeletonUtils.js';
+import { updateJetPhysics } from './clientPhysics.js';
 
-const JET_CONFIG = {
-	'F22': {
-		scale: 10,
-		maxBankAngle: 90,
-		maxTurnRate: 100, // degrees per second at optimal speed
-		optimalTurnSpeed: 250, // speed where turning is best
-		minSpeed: 100,
-		maxSpeed: 500,
-	},
-	'A10': {
-		scale: 10,
-		maxBankAngle: 60,
-		maxTurnRate: 60,
-		optimalTurnSpeed: 250,
-		minSpeed: 80,
-		maxSpeed: 400,
-	}
+//
+const activeExplosions = [];
+const activeSprites = [];
+//
+
+//TEMPERARY: server gives jet config to prevent mis match, in future client will have hard coded copy
+let JET_CONFIG;
+fetch('/jetConfig')
+	.then(response => response.json())
+	.then(config => JET_CONFIG = config);
+
+const mouse = {
+	x: 0, //actual mouse position on screen
+	y: 0,
+	worldX: 0, //mouse maped to world cordnites
+	worldZ: 0,
+	controlRadius: 450 //this value overrided by getControlRadius
 };
 
-const mouse = { x: 0, y: 0, worldX: 0, worldZ: 0 };
 const flightState = {
+	jet: null,
 	heading: 180, // current heading in degrees (0 = south)
 	speed: 100, // current speed
 	position: { x: 0, z: 0 },
 	bankAngle: 0,
+	throttle: 0,
+	aimAngle: 0,
 	testX: 0,
 	testZ: 0
 }
 
 let menuActive = true;
-const VIEW_HEIGHT = 1000;
+const VIEW_HEIGHT = 2000; //size of world player can see (world units)
+let hasFocus = true;
 
 let scene = null;
 const remotePlayers = new Map();
+let radarContects = [];
 const pendingRemoteSpawns = new Set();
 const jetTemplateCache = new Map();
 const gltfLoader = new GLTFLoader();
 
+//gets token used to join game, passes it to connectToGame
 async function initGuest() {
 	try {
 		const response = await fetch('/init/guest', {
@@ -61,6 +67,7 @@ async function initGuest() {
 		const data = await response.json();
 		const token = data.token;
 		const gamemode = data.gamemode;
+		flightState.jet = data.jet;
 
 		connectToGame(token, gamemode);
 
@@ -70,6 +77,7 @@ async function initGuest() {
 	}
 }
 
+//uses token to connect to game and listen on websocket
 function connectToGame(token, gamemode) {
 	// Get protocol (ws or wss) based on current page protocol
 	const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -86,37 +94,42 @@ function connectToGame(token, gamemode) {
 
 		//server starts the session and gives player info
 		if (data.type === 'session:init') {
-			flightState.position.x = data.pos.x;
-			flightState.position.z = data.pos.z;
+			flightState.position.x = data.position.x;
+			flightState.position.z = data.position.z;
+			flightState.speed = data.speed;
+			flightState.heading = data.heading;
+			flightState.bankAngle = data.bankAngle;
 
 			startClientGame(data, ws); //start the game using player info
 			//after everything is loaded tell server we are ready
 		}
 
-		//server sends its copy of the players physics
 		if (data.type === 'position:update') {
-			flightState.testX = data.pos.x;
-			flightState.testZ = data.pos.z;
+			flightState.testX = data.position.x;
+			flightState.testZ = data.position.z;
 
 			//check how far off client is from server
-			const dx = data.pos.x - flightState.position.x;
-			const dz = data.pos.z - flightState.position.z;
+			const dx = data.position.x - flightState.position.x;
+			const dz = data.position.z - flightState.position.z;
 			const error = Math.hypot(dx, dz);
 
 			if (error > 120) {
 				// large error: snap
-				flightState.position.x = data.pos.x;
-				flightState.position.z = data.pos.z;
-			} else {
+				console.log("snap");
+				flightState.position.x = data.position.x;
+				flightState.position.z = data.position.z;
+			}
+			else {
 				// small error: smooth correction
-				const blend = 0.15;
+				// if (error > 10) console.log(error);
+				const blend = 0.1;
 				flightState.position.x += dx * blend;
 				flightState.position.z += dz * blend;
 			}
 		}
 
 		//server sends list of remote players the client needs to know and display
-		if (data.type === 'world:update') {
+		if (data.type === 'players:update') {
 			if (!scene) return;
 
 			//players the server sent
@@ -133,8 +146,8 @@ function connectToGame(token, gamemode) {
 				}
 
 				//update their physics based on snapshot
-				remote.position.x = p.pos.x;
-				remote.position.z = p.pos.z;
+				remote.position.x = p.position.x;
+				remote.position.z = p.position.z;
 				remote.rotation.y = (p.heading * Math.PI / 180) + Math.PI;
 				remote.rotation.z = p.bankAngle * Math.PI / 180;
 			}
@@ -149,6 +162,12 @@ function connectToGame(token, gamemode) {
 			}
 		}
 
+		if(data.type === 'radar:update'){
+			const radarContacts = data.radarContacts;
+			updateRadar(radarContacts);
+			console.log(radarContacts);
+		}
+
 	}
 
 	ws.onerror = (error) => {
@@ -160,6 +179,7 @@ function connectToGame(token, gamemode) {
 	};
 }
 
+//loads GLTF models for remote players, uses cache system to avoid reloading identical models
 async function getJetTemplate(jetModel) {
 	const cached = jetTemplateCache.get(jetModel);
 	if (cached) return cached;
@@ -191,7 +211,7 @@ async function spawnRemoteJet(playerState) {
 		const remoteJet = cloneSkeleton(template);
 		const config = JET_CONFIG[playerState.jet] || JET_CONFIG.F22;
 		remoteJet.scale.set(config.scale, config.scale, config.scale);
-		remoteJet.position.set(playerState.pos.x, 0, playerState.pos.z);
+		remoteJet.position.set(playerState.position.x, 0, playerState.position.z);
 		remoteJet.rotation.y = (playerState.heading * Math.PI / 180) + Math.PI;
 		remoteJet.rotation.z = playerState.bankAngle * Math.PI / 180;
 
@@ -204,8 +224,50 @@ async function spawnRemoteJet(playerState) {
 	}
 }
 
+const RADAR_CENTER = 100;   // SVG center
+const RADAR_RADIUS = 86;    // SVG radar ring radius
+const WORLD_RADIUS = 8000;  // how many world units the radar edge represents
+function updateRadar(contacts) {
+    const blipGroup = document.getElementById('radar-blips');
+    if (!blipGroup) return;
+
+    blipGroup.innerHTML = '';
+
+    for (const [x, z] of contacts) {
+        const dx = x - flightState.position.x;
+        const dz = z - flightState.position.z;
+
+        if (Math.hypot(dx, dz) > WORLD_RADIUS) continue;
+
+        const scale = RADAR_RADIUS / WORLD_RADIUS;
+        const svgX = RADAR_CENTER + dx * scale;
+        const svgZ = RADAR_CENTER + dz * scale;
+
+        const g = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+
+        const outer = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        outer.setAttribute('cx', svgX);
+        outer.setAttribute('cy', svgZ);
+        outer.setAttribute('r', '2.5');
+        outer.setAttribute('fill', '#4de3ff');
+
+        const inner = document.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        inner.setAttribute('cx', svgX);
+        inner.setAttribute('cy', svgZ);
+        inner.setAttribute('r', '1');
+        inner.setAttribute('fill', '#ffffff');
+
+        g.appendChild(outer);
+        g.appendChild(inner);
+        blipGroup.appendChild(g);
+    }
+}
+
+//creates envirment for game
 function startClientGame(session, ws) {
 	menuActive = false;
+
+	document.getElementById('radar').classList.add('visible');
 
 	const canvas = setupCanvas();
 	hideMenu();
@@ -219,6 +281,7 @@ function startClientGame(session, ws) {
 
 	setupWorld(session);
 	loadPlayerJet(session.jet, ws);
+	getControlRadius(camera);
 
 	const directionArrow = createDirectionArrow();
 
@@ -227,123 +290,71 @@ function startClientGame(session, ws) {
 	startRenderLoop(renderer, camera, directionArrow, session.jet, ws);
 }
 
-//calculates the shortest rotation between two angles (handles the wraparound from 359° to 0°
-function angleDifference(target, current) {
-	let diff = target - current;
-	// Normalize to -180 to +180
-	while (diff > 180) diff -= 360;
-	while (diff < -180) diff += 360;
-	return diff;
-}
-
-// Calculate turn rate based on speed (g-force mechanics)
-function calculateTurnRate(speed, config) {
-	const { maxTurnRate, optimalTurnSpeed, minSpeed, maxSpeed } = config;
-
-	// Calculate how far we are from optimal speed
-	const speedDiff = Math.abs(speed - optimalTurnSpeed);
-	const maxDiff = Math.max(optimalTurnSpeed - minSpeed, maxSpeed - optimalTurnSpeed);
-
-	// Turn rate is best at optimal speed, decreases as you get faster or slower
-	// Using a parabolic curve centered at optimal speed
-	const efficiency = 1 - (speedDiff / maxDiff) * 0.6; // 0.6 = how much slower turning gets
-
-	return maxTurnRate * efficiency;
-}
-
-function updateJetPhysics(jet, config, deltaTime) {
-	if (!jet) return;
-
-	// Calculate angle to mouse cursor
-	const dx = mouse.worldX - flightState.position.x;
-	const dz = mouse.worldZ - flightState.position.z;
-	const targetHeading = Math.atan2(dx, dz) * (180 / Math.PI); // Convert to degrees
-
-	// Calculate how much we need to turn
-	const headingDiff = angleDifference(targetHeading, flightState.heading);
-
-	// Get current turn rate based on speed
-	const currentTurnRate = calculateTurnRate(flightState.speed, config);
-
-	// Apply turn (limited by turn rate)
-	const turnAmount = Math.sign(headingDiff) * Math.min(Math.abs(headingDiff), currentTurnRate * deltaTime);
-	flightState.heading += turnAmount;
-
-	// Normalize heading to 0-360
-	while (flightState.heading >= 360) flightState.heading -= 360;
-	while (flightState.heading < 0) flightState.heading += 360;
-
-	// Update position based on heading and speed
-	const headingRad = flightState.heading * (Math.PI / 180);
-	const velocityX = Math.sin(headingRad) * flightState.speed * deltaTime; // 0.016 ≈ 1/60 for smooth movement
-	const velocityZ = Math.cos(headingRad) * flightState.speed * deltaTime;
-
-	flightState.position.x += velocityX;
-	flightState.position.z += velocityZ;
-
-	// Update jet visual position and rotation
-	jet.position.x = flightState.position.x;
-	jet.position.z = flightState.position.z;
-
-	jet.rotation.y = headingRad + (180 * (Math.PI / 180)); //extra 180 degrees added at the end to fix bug DONT REMOVE
-
-	// Calculate target bank angle based on turn rate
-	const targetBankAngle = (turnAmount / (currentTurnRate * deltaTime)) * config.maxBankAngle;
-
-	// Smoothly interpolate current bank angle towards target
-	const bankSmoothness = 5; // Higher = faster response, lower = smoother
-	flightState.bankAngle += (targetBankAngle - flightState.bankAngle) * Math.min(deltaTime * bankSmoothness, 1);
-
-	// Apply the smoothed bank angle
-	jet.rotation.z = flightState.bankAngle * (Math.PI / 180);
-}
-
 function createDirectionArrow() {
-	// Create a small triangle that points upward (towards +Z in world space)
-	const shape = new THREE.Shape();
-	const size = 15; // Size of the arrow
-	shape.moveTo(0, size); // tip
-	shape.lineTo(-size * 0.5, -size * 0.5); // bottom left
-	shape.lineTo(size * 0.5, -size * 0.5); // bottom right
-	shape.lineTo(0, size); // back to tip
+	const arrow = new THREE.Group();
 
-	const geometry = new THREE.ShapeGeometry(shape);
-	const material = new THREE.MeshBasicMaterial({
-		color: 0x00ff00,
-		side: THREE.DoubleSide,
+	const ringMaterial = new THREE.MeshBasicMaterial({
+		color: 0x4de3ff,
 		transparent: true,
-		opacity: 0.8
+		opacity: 0.75,
+		blending: THREE.AdditiveBlending,
+		depthWrite: false,
+		side: THREE.DoubleSide
 	});
+	const chevronMaterial = ringMaterial.clone();
+	chevronMaterial.opacity = 0.9;
 
-	const arrow = new THREE.Mesh(geometry, material);
-	arrow.rotation.x = -Math.PI / 2; // Lay it flat on the ground
-	arrow.position.y = 1; // Slightly above ground to avoid z-fighting
+	const ring = new THREE.Mesh(new THREE.RingGeometry(13, 17, 36), ringMaterial);
+	arrow.add(ring);
+
+	const chevronShape = new THREE.Shape();
+	chevronShape.moveTo(0, 11);
+	chevronShape.lineTo(-6, -7);
+	chevronShape.lineTo(0, -2.5);
+	chevronShape.lineTo(6, -7);
+	chevronShape.lineTo(0, 11);
+	const chevron = new THREE.Mesh(new THREE.ShapeGeometry(chevronShape), chevronMaterial);
+	arrow.add(chevron);
+
+	arrow.rotation.x = -Math.PI / 2;
+	arrow.position.y = 1;
+	arrow.userData.ringMaterial = ringMaterial;
+	arrow.userData.chevronMaterial = chevronMaterial;
 
 	scene.add(arrow);
 	return arrow;
 }
 
-function updateDirectionArrow(arrow, jet, mouseWorldX, mouseWorldZ) {
-	if (!arrow) return;
+function updateDirectionArrow(arrow, jet, mouseWorldX, mouseWorldZ, controlRadius) {
+	if (!arrow || !jet) return;
 
-	// Calculate angle from jet to mouse
 	const dx = mouseWorldX - jet.position.x;
 	const dz = mouseWorldZ - jet.position.z;
+	const dist = Math.hypot(dx, dz);
+
+	// avoid divide-by-zero
+	if (dist < 0.0001) return;
+
+	const nx = dx / dist;
+	const nz = dz / dist;
+
+	// arrow follows mouse distance but stops at control radius
+	let clampedDist = Math.min(dist, controlRadius); //dont exceed control distance
+	clampedDist = Math.max(80, clampedDist); //dont cover player
+
+	arrow.position.x = jet.position.x + nx * clampedDist;
+	arrow.position.z = jet.position.z + nz * clampedDist;
+
 	const targetAngle = Math.atan2(dx, dz);
-
-	// Position arrow around the jet at a fixed radius
-	const box = new THREE.Box3().setFromObject(jet);
-	const sphere = new THREE.Sphere();
-	box.getBoundingSphere(sphere);
-	const radius = sphere.radius;
-
-	arrow.position.x = jet.position.x + Math.sin(targetAngle) * radius;
-	arrow.position.z = jet.position.z + Math.cos(targetAngle) * radius;
-
-	// Rotate arrow to point away from center (outward)
-	// Since the arrow tip points toward +Y in local space (before x rotation),
-	// and we rotated it to lie flat, rotation.z controls which way it points
 	arrow.rotation.z = targetAngle + Math.PI;
+
+	const ratio = Math.min(dist / controlRadius, 1);
+	const scale = 0.85 + ratio * 0.55;
+	arrow.scale.setScalar(scale);
+
+	const pulse = 0.6 + Math.sin(performance.now() * 0.012) * 0.2;
+	arrow.userData.ringMaterial.opacity = 0.45 + ratio * 0.2 + pulse * 0.08;
+	arrow.userData.chevronMaterial.opacity = 0.65 + ratio * 0.2 + pulse * 0.1;
 }
 
 function setupCanvas() {
@@ -370,11 +381,13 @@ function hideMenu() {
 	if (main) main.classList.add('hidden');
 	const brand = document.getElementById('game-brand');
 	if (brand) brand.classList.add('hidden');
+	const radar = document.getElementById('radar');
+	if (radar) radar.classList.add('visible'); // ← add this
 }
 
 function setupWorld(session) {
 	const gridSize = session.worldSize;
-	const divisions = gridSize / 50; //each box is x world units
+	const divisions = gridSize / 100; //each box is x world units
 
 	// Ground plane
 	const geometry = new THREE.PlaneGeometry(gridSize, gridSize);
@@ -443,39 +456,102 @@ function setupResizeHandler(camera, renderer, viewHeight) {
 		camera.updateProjectionMatrix();
 
 		renderer.setSize(window.innerWidth, window.innerHeight);
+
+		getControlRadius(camera);
 	});
 }
 
 //Update mouse world coordinates based on current camera position
 //mouse position needs to based off world coordinates for use in game
-let lastMouseSendTime = 0; //used to decide whether to send mouse position update to the server
-function updateMouseWorldPosition(camera, ws) {
+function updateMouseWorldPosition(camera) {
 	const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
 	vector.unproject(camera);
 	mouse.worldX = vector.x;
 	mouse.worldZ = vector.z;
+}
+
+//call after mouse world position has been updated
+//update the desired thrust
+function updateThrottle() {
+	if (!hasFocus) {
+		flightState.throttle = 0;
+		return;
+	}
+
+	const dx = mouse.worldX - flightState.position.x;
+	const dz = mouse.worldZ - flightState.position.z;
+
+	const distanceFromPlayer = Math.hypot(dx, dz);
+	const throttle = Math.min(distanceFromPlayer / mouse.controlRadius, 1);
+
+	if (!Number.isFinite(throttle)) return;
+
+	flightState.throttle = throttle;
+}
+
+//update the desired angle the player wants to fly at
+function updateAimAngle() {
+	if (!hasFocus) return;
+
+	const dx = mouse.worldX - flightState.position.x;
+	const dz = mouse.worldZ - flightState.position.z;
+
+	const aimAngle = Math.atan2(dx, dz);
+
+	if (!Number.isFinite(aimAngle)) return;
+
+	flightState.aimAngle = aimAngle;
+}
+
+let lastInputSendTime = 0;
+let inputSeq = 0;
+function sendInputUpdate(ws) {
+	if (ws.readyState !== WebSocket.OPEN) return;
 
 	const now = performance.now();
-	//60 Hz cap
-	if ((now - lastMouseSendTime) >= (1000 / 60)) {
-		if (ws.readyState !== WebSocket.OPEN) return; //dont send update if socket closes
+	if (now - lastInputSendTime < (1000 / 30)) return; // too soon, skip cap at 30Hz
 
-		ws.send(JSON.stringify({
-			type: 'mouse:update',
-			mouse: {
-				worldX: mouse.worldX,
-				worldZ: mouse.worldZ
-			}
-		}));
-		lastMouseSendTime = now;
-	}
+	inputSeq++;
+	const input = {
+		aimAngle: flightState.aimAngle,
+		throttle: flightState.throttle
+	};
+
+	ws.send(JSON.stringify({
+		type: 'input:update',
+		seq: inputSeq,
+		input
+	}));
+
+	lastInputSendTime = now;
+}
+
+let lastRadarRequestTime = 0;
+function requestRadarUpdate(ws){
+	if (ws.readyState !== WebSocket.OPEN) return;
+
+	const now = performance.now();
+	if (now - lastRadarRequestTime < 3000) return; // too soon, skip cap at 1 request every 3 seconds (radar rotation)
+
+	ws.send(JSON.stringify({
+		type: 'radar:request'
+	}));
+	lastRadarRequestTime = now;
+}
+
+function getControlRadius(camera) {
+	const viewWidth = camera.right - camera.left;
+	const viewHeight = camera.top - camera.bottom;
+	return Math.min(viewWidth, viewHeight) * 0.4;
 }
 
 function startRenderLoop(renderer, camera, directionArrow, jetModelName, ws) {
 	const config = JET_CONFIG[jetModelName];
 	let lastTime = null;
 
+	//
 	const circle = createCircle(25);
+	//
 
 	function animate(currentTime) {
 		requestAnimationFrame(animate);
@@ -491,22 +567,32 @@ function startRenderLoop(renderer, camera, directionArrow, jetModelName, ws) {
 		let deltaTime = (currentTime - lastTime) / 1000;
 		lastTime = currentTime;
 
-		deltaTime = Math.min(deltaTime, 1 / 30); //safty to prevent deltaTime from being huge from lag
+		deltaTime = Math.min(deltaTime, 1 / 60); //safty to prevent deltaTime from being huge from lag
+
+		//
+		updateExplosions(deltaTime);
+		//
 
 		updateCamera(camera, jet);
-		updateMouseWorldPosition(camera, ws);
-		updateJetPhysics(jet, config, deltaTime);
-		updateDirectionArrow(directionArrow, jet, mouse.worldX, mouse.worldZ);
+		updateMouseWorldPosition(camera);
+		updateAimAngle();
+		updateThrottle();
+		sendInputUpdate(ws);
+		updateJetPhysics(jet, config, flightState, deltaTime);
+		updateDirectionArrow(directionArrow, jet, mouse.worldX, mouse.worldZ, mouse.controlRadius);
+		requestRadarUpdate(ws);
 
+		//
 		circle.position.x = flightState.testX;
 		circle.position.z = flightState.testZ;
+		//
 
 		renderer.render(scene, camera);
 	}
 	animate(0);
 }
 
-function createCircle(radius, color = 0xff0000, segments = 64) {
+function createCircle(radius, color = 0xff0000, segments = 16) {
 	// Create circle geometry
 	const geometry = new THREE.RingGeometry(
 		radius - 2,  // inner radius (slightly smaller to create a ring/outline)
@@ -810,3 +896,137 @@ function loadPlayerJet(jetModel, ws) {
 
 	window.getSelectedModel = () => selectedModel;
 })();
+
+//handle mouse leaving screen and user leaving window (AFK pauses input)
+(() => {
+	// Mouse leaving the window
+	window.addEventListener('mouseleave', () => {
+		hasFocus = false;
+	});
+
+	window.addEventListener('mouseenter', () => {
+		hasFocus = true;
+	});
+
+	// Tab switching
+	document.addEventListener('visibilitychange', () => {
+		hasFocus = !document.hidden;
+	});
+
+	// Window losing focus
+	window.addEventListener('blur', () => {
+		hasFocus = false;
+	});
+
+	window.addEventListener('focus', () => {
+		hasFocus = true;
+	});
+})();
+
+//--------------------------------------------
+
+function explodeJet(jetObject) {
+	const worldPos = new THREE.Vector3();
+	jetObject.getWorldPosition(worldPos);
+
+	activeSprites.push(spawnExplosionSprite(worldPos)); // add this line
+
+	const pieces = [];
+
+	// collect all meshes FIRST without modifying anything
+	const meshes = [];
+	jetObject.traverse((child) => {
+		if (child.isMesh) meshes.push(child);
+	});
+
+	// then detach and set up each one
+	for (const child of meshes) {
+		child.material = child.material.clone();
+
+		scene.attach(child); // now safe to modify tree
+
+		child.userData.velocity = new THREE.Vector3(
+			(Math.random() - 0.5) * 300,
+			Math.random() * 350,
+			(Math.random() - 0.5) * 300
+		);
+		child.userData.spin = new THREE.Vector3(
+			(Math.random() - 0.5) * 5,
+			(Math.random() - 0.5) * 5,
+			(Math.random() - 0.5) * 5
+		);
+		child.userData.life = 1.0;
+
+		pieces.push(child);
+	}
+
+	//scene.remove(jetObject);
+	//window.playerJet = null;
+	activeExplosions.push(pieces);
+}
+
+function spawnExplosionSprite(position) {
+	const texture = new THREE.TextureLoader().load('/Textures/explosion.png');
+	const COLS = 4, ROWS = 4;
+	const TOTAL = COLS * ROWS;
+
+	texture.repeat.set(1 / COLS, 1 / ROWS);
+	texture.offset.set(0, 1 - 1 / ROWS);
+
+	const material = new THREE.SpriteMaterial({ map: texture, transparent: true });
+	const sprite = new THREE.Sprite(material);
+	sprite.scale.set(200, 200, 1);
+	sprite.position.copy(position);
+	scene.add(sprite);
+
+	let frame = 0;
+	const FPS = 24;
+	let elapsed = 0;
+
+	sprite.userData.update = (delta) => {
+		elapsed += delta;
+		if (elapsed >= 1 / FPS) {
+			elapsed = 0;
+			frame++;
+			if (frame >= TOTAL) {
+				scene.remove(sprite);
+				return false; // signal done
+			}
+			const col = frame % COLS;
+			const row = Math.floor(frame / COLS);
+			texture.offset.set(col / COLS, 1 - (row + 1) / ROWS);
+		}
+		return true; // still alive
+	};
+
+	return sprite;
+}
+
+function updateExplosions(delta) {
+	for (let i = activeExplosions.length - 1; i >= 0; i--) {
+		const alive = activeSprites[i].userData.update(delta);
+		if (!alive) activeSprites.splice(i, 1);
+		const pieces = activeExplosions[i];
+		let allDead = true;
+
+		for (const p of pieces) {
+			p.userData.life -= delta * 0.5;
+			if (p.userData.life <= 0) {
+				scene.remove(p);
+				continue;
+			}
+			allDead = false;
+			p.position.addScaledVector(p.userData.velocity, delta);
+			p.userData.velocity.y -= 9.8 * delta;
+			p.rotation.x += p.userData.spin.x * delta;
+			p.rotation.y += p.userData.spin.y * delta;
+			p.rotation.z += p.userData.spin.z * delta;
+			const s = Math.max(0, p.userData.life);
+			p.scale.set(s, s, s);
+			p.material.transparent = true;
+			p.material.opacity = p.userData.life;
+		}
+
+		if (allDead) activeExplosions.splice(i, 1);
+	}
+}

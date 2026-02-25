@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Radar</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #111416;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+    font-family: 'Courier New', monospace;
+  }
+
+  .radar-wrap {
+    position: relative;
+    width: 200px;
+    height: 200px;
+  }
+
+  /* ── outer bezel ── */
+  .radar-bezel {
+    position: absolute;
+    inset: 0;
+    border-radius: 50%;
+    background: radial-gradient(circle at 40% 35%, #1c2a2e 0%, #0a1214 60%, #060d0f 100%);
+    border: 1px solid rgba(77, 227, 255, 0.25);
+    box-shadow:
+      0 0 0 1px rgba(77, 227, 255, 0.08),
+      0 0 20px rgba(77, 227, 255, 0.06),
+      inset 0 0 30px rgba(0,0,0,0.6),
+      inset 0 1px 0 rgba(77, 227, 255, 0.12);
+  }
+
+  /* ── svg sits on top of bezel ── */
+  .radar-svg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  /* ── sweep cone ── */
+  .sweep {
+    transform-origin: 100px 100px;
+    animation: sweep 3s linear infinite;
+  }
+
+  @keyframes sweep {
+    from { transform: rotate(0deg); }
+    to   { transform: rotate(360deg); }
+  }
+
+  /* ── blips ── */
+  .blip {
+    animation: blip-fade 3s linear infinite;
+    opacity: 0;
+  }
+  .blip-1 { animation-delay: 0.4s; }
+  .blip-2 { animation-delay: 1.9s; }
+  .blip-3 { animation-delay: 0.9s; }
+
+  @keyframes blip-fade {
+    0%   { opacity: 0; }
+    2%   { opacity: 1; }
+    40%  { opacity: 0.6; }
+    100% { opacity: 0; }
+  }
+
+  /* ── scan trail (fading arc behind sweep) ── */
+  .trail {
+    transform-origin: 100px 100px;
+    animation: sweep 3s linear infinite;
+  }
+
+  /* ── corner bracket decorations ── */
+  .radar-corners {
+    position: absolute;
+    inset: -8px;
+    pointer-events: none;
+  }
+  .radar-corners::before,
+  .radar-corners::after {
+    content: '';
+    position: absolute;
+    width: 14px;
+    height: 14px;
+    border-color: rgba(77, 227, 255, 0.5);
+    border-style: solid;
+  }
+  .radar-corners::before {
+    top: 8px; left: 8px;
+    border-width: 1px 0 0 1px;
+  }
+  .radar-corners::after {
+    bottom: 8px; right: 8px;
+    border-width: 0 1px 1px 0;
+  }
+
+  /* ── label ── */
+  .radar-label {
+    position: absolute;
+    bottom: -22px;
+    left: 50%;
+    transform: translateX(-50%);
+    font-size: 9px;
+    letter-spacing: 0.25em;
+    color: rgba(77, 227, 255, 0.4);
+    white-space: nowrap;
+    text-transform: uppercase;
+  }
+
+  /* ── cardinal ticks ── */
+  .cardinal {
+    position: absolute;
+    font-size: 8px;
+    letter-spacing: 0.05em;
+    color: rgba(77, 227, 255, 0.35);
+    pointer-events: none;
+  }
+  .cardinal-n { top: 4px;  left: 50%; transform: translateX(-50%); }
+  .cardinal-s { bottom: 4px; left: 50%; transform: translateX(-50%); }
+  .cardinal-e { right: 6px; top: 50%; transform: translateY(-50%); }
+  .cardinal-w { left: 6px;  top: 50%; transform: translateY(-50%); }
+</style>
+</head>
+<body>
+
+<div class="radar-wrap">
+  <div class="radar-bezel"></div>
+
+  <svg class="radar-svg" viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <!-- sweep gradient: bright leading edge fading to nothing -->
+      <radialGradient id="sweepGrad" cx="100" cy="100" r="86" gradientUnits="userSpaceOnUse">
+        <stop offset="0%"   stop-color="#4de3ff" stop-opacity="0"/>
+        <stop offset="85%"  stop-color="#4de3ff" stop-opacity="0.18"/>
+        <stop offset="100%" stop-color="#4de3ff" stop-opacity="0.35"/>
+      </radialGradient>
+
+      <!-- clip to circle -->
+      <clipPath id="circleClip">
+        <circle cx="100" cy="100" r="86"/>
+      </clipPath>
+
+      <!-- blip glow -->
+      <filter id="blipGlow" x="-100%" y="-100%" width="300%" height="300%">
+        <feGaussianBlur stdDeviation="2.5" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+
+      <!-- subtle line glow -->
+      <filter id="lineGlow" x="-20%" y="-20%" width="140%" height="140%">
+        <feGaussianBlur stdDeviation="1" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+    </defs>
+
+    <g clip-path="url(#circleClip)">
+
+      <!-- range rings -->
+      <circle cx="100" cy="100" r="28.7" fill="none" stroke="rgba(77,227,255,0.10)" stroke-width="0.75"/>
+      <circle cx="100" cy="100" r="57.3" fill="none" stroke="rgba(77,227,255,0.10)" stroke-width="0.75"/>
+      <circle cx="100" cy="100" r="86"   fill="none" stroke="rgba(77,227,255,0.14)" stroke-width="1"/>
+
+      <!-- crosshairs -->
+      <line x1="100" y1="14" x2="100" y2="186" stroke="rgba(77,227,255,0.08)" stroke-width="0.75"/>
+      <line x1="14"  y1="100" x2="186" y2="100" stroke="rgba(77,227,255,0.08)" stroke-width="0.75"/>
+
+      <!-- diagonal faint lines -->
+      <line x1="39" y1="39" x2="161" y2="161" stroke="rgba(77,227,255,0.04)" stroke-width="0.5"/>
+      <line x1="161" y1="39" x2="39" y2="161" stroke="rgba(77,227,255,0.04)" stroke-width="0.5"/>
+
+      <!-- sweep trail (arc sector behind the line) -->
+      <g class="trail">
+        <!-- 70-degree fading sector -->
+        <path
+          d="M100,100 L100,14 A86,86 0 0,0 19.2,56.6 Z"
+          fill="url(#sweepGrad)"
+          opacity="0.6"
+        />
+      </g>
+
+      <!-- sweep line -->
+      <g class="sweep" filter="url(#lineGlow)">
+        <line x1="100" y1="100" x2="100" y2="14"
+              stroke="#4de3ff" stroke-width="1.25"
+              stroke-opacity="0.9"/>
+        <!-- bright dot at tip -->
+        <circle cx="100" cy="16" r="1.5" fill="#4de3ff" opacity="0.9"/>
+      </g>
+
+      <!-- center dot -->
+      <circle cx="100" cy="100" r="2.5" fill="#4de3ff" opacity="0.7"/>
+      <circle cx="100" cy="100" r="1"   fill="#ffffff" opacity="0.9"/>
+
+      <!-- blips -->
+      <g filter="url(#blipGlow)">
+        <!-- blip 1 -->
+        <g class="blip blip-1">
+          <circle cx="132" cy="68" r="2.5" fill="#4de3ff"/>
+          <circle cx="132" cy="68" r="1"   fill="#ffffff"/>
+        </g>
+        <!-- blip 2 -->
+        <g class="blip blip-2">
+          <circle cx="72" cy="130" r="2.5" fill="#4de3ff"/>
+          <circle cx="72" cy="130" r="1"   fill="#ffffff"/>
+        </g>
+        <!-- blip 3 -->
+        <g class="blip blip-3">
+          <circle cx="148" cy="118" r="2" fill="#4de3ff"/>
+          <circle cx="148" cy="118" r="0.8" fill="#ffffff"/>
+        </g>
+      </g>
+
+    </g><!-- end clip -->
+
+    <!-- outer ring on top -->
+    <circle cx="100" cy="100" r="86" fill="none"
+            stroke="rgba(77,227,255,0.22)" stroke-width="1"/>
+
+    <!-- cardinal tick marks outside ring -->
+    <line x1="100" y1="12" x2="100" y2="8"  stroke="rgba(77,227,255,0.5)" stroke-width="1.5"/>
+    <line x1="100" y1="188" x2="100" y2="192" stroke="rgba(77,227,255,0.3)" stroke-width="1"/>
+    <line x1="12"  y1="100" x2="8"   y2="100" stroke="rgba(77,227,255,0.3)" stroke-width="1"/>
+    <line x1="188" y1="100" x2="192" y2="100" stroke="rgba(77,227,255,0.3)" stroke-width="1"/>
+
+  </svg>
+
+  <!-- cardinal letters inside bezel -->
+  <span class="cardinal cardinal-n">N</span>
+  <span class="cardinal cardinal-s">S</span>
+  <span class="cardinal cardinal-e">E</span>
+  <span class="cardinal cardinal-w">W</span>
+
+  <div class="radar-corners"></div>
+  <div class="radar-label">RDR · MK-IV</div>
+</div>
+
+</body>
+</html>
